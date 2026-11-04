@@ -671,17 +671,13 @@ int main(int argc, char* argv[]) {
             if (argc >= 6) repetition_penalty = std::stof(argv[5]);
 
             titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
+            // 'generate' always uses the base pre-trained weights for raw code generation.
+            // Use './titan_lm chat' for instruction-following (uses titan_instruct_weights.bin).
             std::string weight_file = "titan_weights.bin";
-            if (std::filesystem::exists("titan_instruct_weights.bin")) {
-                weight_file = "titan_instruct_weights.bin";
-            }
 
             if (std::filesystem::exists(weight_file)) {
                 model.load_weights(weight_file);
                 std::cout << "[generate] Loaded checkpoint: " << weight_file << "\n";
-            } else if (std::filesystem::exists("titan_weights.bin")) {
-                model.load_weights("titan_weights.bin");
-                std::cout << "[generate] Loaded checkpoint: titan_weights.bin\n";
             } else {
                 std::cout << "[generate] WARNING: No checkpoint found. "
                           << "Run 'make ingest && make train' first.\n";
@@ -726,7 +722,7 @@ int main(int argc, char* argv[]) {
             std::string prompt = "<|user|>\n" + user_instruction + "\n<|assistant|>\n";
             std::cout << "\n──────────────── Conversational Dialogue ────────────────\n";
             std::cout << "[User]: " << user_instruction << "\n\n[Assistant]:\n";
-            model.generate(prompt, tokenizer, gen_tokens, temperature, 1337, true, repetition_penalty);
+            model.generate(prompt, tokenizer, gen_tokens, temperature, 1337, true, repetition_penalty, true);
             std::cout << "\n──────────────────────────────────────────────────────────\n";
             return 0;
         }

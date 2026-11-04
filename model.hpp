@@ -208,7 +208,9 @@ public:
     bool save_weights(const std::string& filepath, uint32_t step = 0, float loss = 0.0f) const;
     bool load_weights(const std::string& filepath);
 
-    // Autoregressive token generation with real-time stdout streaming and repetition penalty
+    // Autoregressive token generation with real-time stdout streaming and repetition penalty.
+    // suppress_special_tokens: if true, pieces matching special token strings are silently
+    // dropped from stdout (and the returned string), and generation halts on <|end_of_text|>.
     std::string generate(
         const std::string& prompt,
         const Tokenizer& tokenizer,
@@ -216,7 +218,8 @@ public:
         float temperature = 0.8f,
         uint64_t seed = 42,
         bool stream_to_stdout = true,
-        float repetition_penalty = 1.20f
+        float repetition_penalty = 1.20f,
+        bool suppress_special_tokens = false
     );
 };
 

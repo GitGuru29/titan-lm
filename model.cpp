@@ -576,7 +576,8 @@ std::string TitanModel::generate(
     float temperature,
     uint64_t seed,
     bool stream_to_stdout,
-    float repetition_penalty
+    float repetition_penalty,
+    bool suppress_special_tokens
 ) {
     std::vector<TokenId> tokens = tokenizer.encode(prompt, true, false);
     if (tokens.empty()) tokens.push_back(BOS_TOKEN_ID);
@@ -593,6 +594,21 @@ std::string TitanModel::generate(
     constexpr float MIN_TEMP    = 1e-4f;
 
     std::string generated_text;
+    // In chat mode we maintain a print cursor: text before this index has already
+    // been streamed to stdout.  We hold back HOLD_BACK chars so we can retroactively
+    // detect and suppress multi-token stop markers before they hit the terminal.
+    size_t print_cursor = 0;
+    constexpr size_t HOLD_BACK = 18; // length of longest stop marker
+
+    // All stop markers we recognise in chat mode
+    static constexpr std::string_view STOP_MARKERS[] = {
+        "<|end_of_text|>",    // 16 chars
+        "<|user|>",           //  9 chars
+        "<|assistant|>",      // 14 chars
+        "<|begin_of_text|>",  // 18 chars
+        "<|pad|>",            //  7 chars
+        "<|unk|>",            //  7 chars
+    };
 
     for (size_t step = 0; step < max_new_tokens; ++step) {
         // ── Sliding context window ───────────────────────────────────────
@@ -691,11 +707,91 @@ std::string TitanModel::generate(
 
         tokens.push_back(next_token);
         std::string piece = tokenizer.token_to_piece(next_token);
-        generated_text.append(piece);
 
-        if (stream_to_stdout) {
-            std::cout << piece << std::flush;
+        // ── Special-token suppression (chat mode) ─────────────────────────
+        // The model may emit structural dialogue markers (<|user|>, <|assistant|>,
+        // <|end_of_text|>) either as a single merged BPE token or spread across
+        // multiple small tokens.  Strategy:
+        //   1. Fast-path: exact piece match  → flush buffered safe text, then stop.
+        //   2. Accumulate piece into generated_text.
+        //   3. Suffix-scan: if the tail matches any stop marker, trim it, flush safe
+        //      buffered text (up to trim point), then stop.
+        //   4. Buffered streaming: only flush chars that are ≥ HOLD_BACK behind the
+        //      current tail so a partial marker is never streamed prematurely.
+        if (suppress_special_tokens) {
+            // Fast path: exact piece match — flush buffer then stop
+            bool exact_stop = false;
+            for (auto m : STOP_MARKERS) {
+                if (piece == m) { exact_stop = true; break; }
+            }
+            if (exact_stop) {
+                if (stream_to_stdout && print_cursor < generated_text.size()) {
+                    std::cout << std::string_view(
+                        generated_text.data() + print_cursor,
+                        generated_text.size() - print_cursor
+                    ) << std::flush;
+                }
+                break;
+            }
+
+            generated_text.append(piece);
+
+            // Suffix-scan for multi-token stop markers
+            bool stop_found = false;
+            for (auto marker : STOP_MARKERS) {
+                if (generated_text.size() >= marker.size()) {
+                    std::string_view tail(
+                        generated_text.data() + generated_text.size() - marker.size(),
+                        marker.size()
+                    );
+                    if (tail == marker) {
+                        // Trim the marker from output
+                        generated_text.resize(generated_text.size() - marker.size());
+                        stop_found = true;
+                        break;
+                    }
+                }
+            }
+
+            if (stream_to_stdout) {
+                // Flush the safe zone: everything before (size - HOLD_BACK)
+                size_t safe_end = (generated_text.size() > HOLD_BACK)
+                                  ? (generated_text.size() - HOLD_BACK) : 0;
+                if (safe_end > print_cursor) {
+                    std::cout << std::string_view(
+                        generated_text.data() + print_cursor,
+                        safe_end - print_cursor
+                    ) << std::flush;
+                    print_cursor = safe_end;
+                }
+            }
+
+            if (stop_found) {
+                // Flush remaining safe text then stop
+                if (stream_to_stdout && print_cursor < generated_text.size()) {
+                    std::cout << std::string_view(
+                        generated_text.data() + print_cursor,
+                        generated_text.size() - print_cursor
+                    ) << std::flush;
+                }
+                break;
+            }
+
+        } else {
+            // Normal (non-chat) mode — append and stream unconditionally
+            generated_text.append(piece);
+            if (stream_to_stdout) {
+                std::cout << piece << std::flush;
+            }
         }
+    }
+
+    // Chat mode: flush any remaining buffered text that's still in the hold-back zone
+    if (suppress_special_tokens && stream_to_stdout && print_cursor < generated_text.size()) {
+        std::cout << std::string_view(
+            generated_text.data() + print_cursor,
+            generated_text.size() - print_cursor
+        ) << std::flush;
     }
 
     return generated_text;
