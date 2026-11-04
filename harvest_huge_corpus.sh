@@ -124,3 +124,4 @@ printf "  ${CYAN}%-32s${NC} : ${GREEN}%s files${NC}\n" "Declarative UI Files (.q
 echo -e "${BOLD}──────────────────────────────────────────────────────────────────${NC}"
 echo -e "${GREEN}${BOLD}✓ Mega-Corpus harvest completed successfully.${NC}"
 echo ""
+
