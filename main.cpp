@@ -403,6 +403,44 @@ int main(int argc, char* argv[]) {
     if (argc >= 2) {
         std::string command = argv[1];
 
+        // ── train-vocab [target_size=4096] [corpus_file=training_data.txt] ──
+        if (command == "train-vocab") {
+            size_t target_vocab = 4096;
+            if (argc >= 3) {
+                target_vocab = static_cast<size_t>(std::stoul(argv[2]));
+            }
+            std::filesystem::path corpus_path = (argc >= 4) ? argv[3] : "training_data.txt";
+            if (!std::filesystem::exists(corpus_path)) {
+                std::cout << "[train-vocab] Corpus file not found: " << corpus_path
+                          << " — scanning project codebase files...\n";
+                std::vector<std::filesystem::path> src_files;
+                for (const auto& entry : std::filesystem::recursive_directory_iterator(".")) {
+                    if (entry.is_regular_file()) {
+                        auto ext = entry.path().extension().string();
+                        if (ext == ".cpp" || ext == ".hpp" || ext == ".h" || ext == ".qml") {
+                            src_files.push_back(entry.path());
+                        }
+                    }
+                }
+                tokenizer.train_from_files(src_files, target_vocab);
+            } else {
+                std::cout << "[train-vocab] Reading training corpus from: " << corpus_path << "\n";
+                std::ifstream fin(corpus_path, std::ios::binary);
+                std::string corpus_sample;
+                // Sample 2 MB of real code text for rapid high-density merge discovery
+                constexpr size_t SAMPLE_SIZE = 2 * 1024 * 1024;
+                corpus_sample.resize(SAMPLE_SIZE);
+                fin.read(&corpus_sample[0], SAMPLE_SIZE);
+                corpus_sample.resize(fin.gcount());
+                fin.close();
+
+                tokenizer.train(corpus_sample, target_vocab);
+            }
+            std::cout << "[train-vocab] Final vocabulary capacity: "
+                      << tokenizer.vocab_size() << " entries (saved to titan_vocab.txt)\n";
+            return 0;
+        }
+
         // ── tokenize <input_file> [output_bin] ──────────────────────────────
         // Reads any raw text file, encodes via BPE, writes titan_tokens.bin
         if (command == "tokenize" && argc >= 3) {
@@ -470,13 +508,14 @@ int main(int argc, char* argv[]) {
             //   12 layers total:   12 * ~3.15M               = ~37.8M
             //   Total:                                        ≈ 50M params
 
-            std::cout << "\n[train] Phase 6 — 50M Parameter Model Config:\n";
+            std::cout << "\n[train] Phase 6 Scaled Model Config:\n";
             std::cout << "  vocab_size  = " << vocab_size  << "\n";
-            std::cout << "  d_model     = " << d_model     << "  (was 256)\n";
-            std::cout << "  num_layers  = " << num_layers  << "  (was 6)\n";
+            std::cout << "  d_model     = " << d_model     << "\n";
+            std::cout << "  num_layers  = " << num_layers  << "\n";
             std::cout << "  n_heads     = " << n_heads     << "  → head_dim = " << (d_model/n_heads) << "\n";
-            std::cout << "  max_seq     = " << max_seq     << "  (was 128)\n";
-            std::cout << "  est. params ≈ 50M\n\n";
+            std::cout << "  max_seq     = " << max_seq     << "\n";
+            std::cout << "  est. params ≈ " << std::fixed << std::setprecision(2)
+                      << (vocab_size * d_model * 2 + num_layers * (4 * d_model * d_model + 2 * d_model * 4 * d_model + 4 * d_model)) / 1000000.0 << "M\n\n";
 
             titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
 
@@ -503,11 +542,13 @@ int main(int argc, char* argv[]) {
             const size_t n_heads    = 8;
             const size_t max_seq    = 256;
 
-            // Optional args: ./titan_lm generate "prompt" <tokens> <temperature>
-            size_t gen_tokens  = 256;
-            float  temperature = 0.8f;
-            if (argc >= 4) gen_tokens  = static_cast<size_t>(std::stoul(argv[3]));
-            if (argc >= 5) temperature = std::stof(argv[4]);
+            // Optional args: ./titan_lm generate "prompt" [tokens] [temp] [rep_penalty]
+            size_t gen_tokens          = 256;
+            float  temperature         = 0.8f;
+            float  repetition_penalty  = 1.20f;
+            if (argc >= 4) gen_tokens         = static_cast<size_t>(std::stoul(argv[3]));
+            if (argc >= 5) temperature        = std::stof(argv[4]);
+            if (argc >= 6) repetition_penalty = std::stof(argv[5]);
 
             titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
             if (std::filesystem::exists("titan_weights.bin")) {
@@ -521,8 +562,9 @@ int main(int argc, char* argv[]) {
             std::cout << "[generate] Prompt      : \"" << prompt << "\"\n";
             std::cout << "[generate] Max tokens  : " << gen_tokens << "\n";
             std::cout << "[generate] Temperature : " << temperature << "\n";
+            std::cout << "[generate] Repetition P: " << repetition_penalty << "\n";
             std::cout << "\n──────────────────────────────────────────────────\n";
-            model.generate(prompt, tokenizer, gen_tokens, temperature, 1337, true);
+            model.generate(prompt, tokenizer, gen_tokens, temperature, 1337, true, repetition_penalty);
             std::cout << "\n──────────────────────────────────────────────────\n";
             return 0;
         }
@@ -544,11 +586,12 @@ int main(int argc, char* argv[]) {
 
         std::cerr << "Unknown command: " << command << "\n";
         std::cout << "Usage:\n";
-        std::cout << "  " << argv[0] << "                        (runs full Phase 1-5 verification suite)\n";
-        std::cout << "  " << argv[0] << " tokenize <file.txt>    (BPE-encode file → titan_tokens.bin)\n";
-        std::cout << "  " << argv[0] << " train                  (launches complete AdamW training loop)\n";
-        std::cout << "  " << argv[0] << " generate <prompt> [T]  (streams real-time code, optional temp)\n";
-        std::cout << "  " << argv[0] << " benchmark .            (runs system benchmarks)\n";
+        std::cout << "  " << argv[0] << "                                (runs full Phase 1-5 verification suite)\n";
+        std::cout << "  " << argv[0] << " train-vocab [size] [file.txt]  (learns BPE merges up to target size)\n";
+        std::cout << "  " << argv[0] << " tokenize <file.txt>            (BPE-encode file → titan_tokens.bin)\n";
+        std::cout << "  " << argv[0] << " train                          (launches complete AdamW training loop)\n";
+        std::cout << "  " << argv[0] << " generate <p> [N] [T] [rep]     (streams real-time code with repetition penalty)\n";
+        std::cout << "  " << argv[0] << " benchmark .                    (runs system benchmarks)\n";
         return 1;
     }
 

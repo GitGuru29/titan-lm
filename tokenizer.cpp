@@ -75,7 +75,9 @@ MappedTokenBuffer& MappedTokenBuffer::operator=(MappedTokenBuffer&& other) noexc
 
 Tokenizer::Tokenizer(bool load_default_code_merges) {
     init_base_vocab();
-    if (load_default_code_merges) {
+    if (std::filesystem::exists("titan_vocab.txt")) {
+        load_vocab("titan_vocab.txt");
+    } else if (load_default_code_merges) {
         init_default_code_merges();
     }
 }
@@ -635,28 +637,39 @@ void Tokenizer::train(
 ) {
     if (corpus.empty()) return;
 
-    // Reset to pristine base vocabulary
+    // Reset base vocabulary and preload foundational code merges
     init_base_vocab();
+    init_default_code_merges();
 
-    if (target_vocab_size <= BASE_VOCAB_SIZE) return;
+    if (target_vocab_size <= id_to_piece_.size()) return;
 
-    // Convert full raw corpus into byte tokens
-    std::vector<TokenId> tokens;
-    tokens.reserve(corpus.size());
-    for (unsigned char b : corpus) {
-        tokens.push_back(BYTE_TOKEN_OFFSET + b);
-    }
+    // Take a representative sample (up to 2MB) for swift, high-density BPE merge discovery
+    constexpr size_t MAX_TRAIN_CORPUS_BYTES = 2 * 1024 * 1024;
+    std::string_view sample = (corpus.size() > MAX_TRAIN_CORPUS_BYTES)
+        ? corpus.substr(0, MAX_TRAIN_CORPUS_BYTES)
+        : corpus;
+
+    // Initial tokenization using base & default code merges
+    std::vector<TokenId> tokens = encode(sample, false, false);
+
+    std::cout << "[Tokenizer::train] Base vocab: " << id_to_piece_.size()
+              << " entries | Training Sample: " << (sample.size() / 1024.0) << " KB ("
+              << tokens.size() << " initial tokens)\n";
+    std::cout << "[Tokenizer::train] Scaling vocabulary up to " << target_vocab_size << " entries...\n";
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    std::unordered_map<std::pair<TokenId, TokenId>, size_t, PairHash> pair_counts;
+    pair_counts.reserve(65536);
 
     while (id_to_piece_.size() < target_vocab_size && tokens.size() >= 2) {
-        // Fast counting of adjacent token pairs
-        std::unordered_map<std::pair<TokenId, TokenId>, size_t, PairHash> pair_counts;
+        pair_counts.clear();
         for (size_t i = 0; i + 1 < tokens.size(); ++i) {
             pair_counts[{tokens[i], tokens[i + 1]}]++;
         }
 
         if (pair_counts.empty()) break;
 
-        // Identify most frequent pair
         size_t best_count = 0;
         std::pair<TokenId, TokenId> best_pair{0, 0};
         for (const auto& [pair, count] : pair_counts) {
@@ -666,9 +679,15 @@ void Tokenizer::train(
             }
         }
 
-        if (best_count < min_frequency) break;
+        if (best_count < min_frequency) {
+            if (min_frequency > 1) {
+                min_frequency = 1; // Relax threshold to reach exact target capacity
+                continue;
+            }
+            std::cout << "[Tokenizer::train] Min frequency reached at " << id_to_piece_.size() << " tokens.\n";
+            break;
+        }
 
-        // Register new merged token
         TokenId new_id = static_cast<TokenId>(id_to_piece_.size());
         add_merge(best_pair.first, best_pair.second, new_id, next_rank_++);
 
@@ -685,7 +704,21 @@ void Tokenizer::train(
             }
         }
         tokens.resize(write_idx);
+
+        if (id_to_piece_.size() % 500 == 0 || id_to_piece_.size() == target_vocab_size) {
+            std::cout << "  [BPE Merge] " << id_to_piece_.size() << " / " << target_vocab_size
+                      << " tokens (top pair freq: " << best_count << ")\n";
+        }
     }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    double elapsed_s = std::chrono::duration<double>(end_time - start_time).count();
+
+    std::cout << "[Tokenizer::train] Complete: " << id_to_piece_.size() << " total tokens in "
+              << std::fixed << std::setprecision(2) << elapsed_s << "s.\n";
+
+    save_vocab("titan_vocab.txt");
+    std::cout << "[Tokenizer::train] Saved vocabulary to titan_vocab.txt\n";
 }
 
 void Tokenizer::train_from_files(
@@ -701,6 +734,7 @@ void Tokenizer::train_from_files(
             ss << in.rdbuf();
             aggregate_corpus.append(ss.str());
             aggregate_corpus.push_back('\n');
+            if (aggregate_corpus.size() > 3 * 1024 * 1024) break;
         }
     }
     train(aggregate_corpus, target_vocab_size, min_frequency);

@@ -121,8 +121,13 @@ echo -e "  Total lines    : ${GREEN}${TOTAL_LINES}${NC}"
 echo -e "  Dataset size   : ${GREEN}${TOTAL_MB} MB${NC} → $OUT_FILE"
 echo ""
 
-# ── Step 5: Tokenize ─────────────────────────────────────────────────────────
-log "Phase C: Running BPE tokenizer → titan_tokens.bin ..."
+# ── Step 5: BPE Vocabulary Expansion (Move 2: 4,096 entries) ─────────────────
+log "Phase C: Scaling BPE Vocabulary to 4,096 entries..."
+echo ""
+"$BINARY" train-vocab 4096 "$OUT_FILE"
+
+# ── Step 6: Tokenize ─────────────────────────────────────────────────────────
+log "Phase D: Running BPE tokenizer (4,096 vocab) → titan_tokens.bin ..."
 echo ""
 
 "$BINARY" tokenize "$OUT_FILE"

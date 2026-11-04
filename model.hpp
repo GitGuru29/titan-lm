@@ -208,14 +208,15 @@ public:
     bool save_weights(const std::string& filepath, uint32_t step = 0, float loss = 0.0f) const;
     bool load_weights(const std::string& filepath);
 
-    // Autoregressive token generation with real-time stdout streaming
+    // Autoregressive token generation with real-time stdout streaming and repetition penalty
     std::string generate(
         const std::string& prompt,
         const Tokenizer& tokenizer,
         size_t max_new_tokens = 64,
         float temperature = 0.8f,
         uint64_t seed = 42,
-        bool stream_to_stdout = true
+        bool stream_to_stdout = true,
+        float repetition_penalty = 1.20f
     );
 };
 

@@ -575,7 +575,8 @@ std::string TitanModel::generate(
     size_t max_new_tokens,
     float temperature,
     uint64_t seed,
-    bool stream_to_stdout
+    bool stream_to_stdout,
+    float repetition_penalty
 ) {
     std::vector<TokenId> tokens = tokenizer.encode(prompt, true, false);
     if (tokens.empty()) tokens.push_back(BOS_TOKEN_ID);
@@ -607,21 +608,45 @@ std::string TitanModel::generate(
         const size_t T = ctx_tokens.size();
         const float* next_logits = logits.data_ptr() + (T - 1) * vocab_size;
 
+        // ── Repetition & Frequency Penalty (Move 1) ───────────────────────
+        // Active sequence tracking log: count frequencies over sliding window
+        // to depress repeating token probability and kill looping degenerate states.
+        std::vector<float> adjusted_logits(next_logits, next_logits + vocab_size);
+
+        constexpr size_t PENALTY_WINDOW = 64;
+        size_t window_start = (tokens.size() > PENALTY_WINDOW) ? (tokens.size() - PENALTY_WINDOW) : 0;
+        std::unordered_map<TokenId, size_t> token_counts;
+        for (size_t i = window_start; i < tokens.size(); ++i) {
+            token_counts[tokens[i]]++;
+        }
+
+        constexpr float FREQ_PENALTY_FACTOR = 0.15f;
+        for (const auto& [tok, count] : token_counts) {
+            if (tok < vocab_size) {
+                float effective_penalty = repetition_penalty + FREQ_PENALTY_FACTOR * static_cast<float>(count - 1);
+                if (adjusted_logits[tok] > 0.0f) {
+                    adjusted_logits[tok] /= effective_penalty;
+                } else {
+                    adjusted_logits[tok] *= effective_penalty;
+                }
+            }
+        }
+
         TokenId next_token = 0;
 
         // ── Greedy decode (temperature ≈ 0) ─────────────────────────────
         if (temperature < MIN_TEMP) {
-            float best = next_logits[0];
+            float best = adjusted_logits[0];
             for (size_t c = 1; c < vocab_size; ++c) {
-                if (next_logits[c] > best) { best = next_logits[c]; next_token = static_cast<TokenId>(c); }
+                if (adjusted_logits[c] > best) { best = adjusted_logits[c]; next_token = static_cast<TokenId>(c); }
             }
         } else {
             // ── Step 1: temperature-scale logits ─────────────────────────
             std::vector<float> probs(vocab_size);
-            float max_val = *std::max_element(next_logits, next_logits + vocab_size);
+            float max_val = *std::max_element(adjusted_logits.begin(), adjusted_logits.end());
             float sum_exp = 0.0f;
             for (size_t c = 0; c < vocab_size; ++c) {
-                probs[c] = std::exp((next_logits[c] - max_val) / temperature);
+                probs[c] = std::exp((adjusted_logits[c] - max_val) / temperature);
                 sum_exp += probs[c];
             }
             float inv_sum = 1.0f / (sum_exp > 0.0f ? sum_exp : 1e-12f);
