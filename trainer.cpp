@@ -219,7 +219,8 @@ void Trainer::train() {
             std::cout << "  Step [" << std::setw(4) << step << "/" << config.max_steps << "] | "
                       << "Loss: " << std::fixed << std::setprecision(4) << avg_step_loss << " | "
                       << "LR: " << std::scientific << std::setprecision(2) << current_lr << " | "
-                      << "Speed: " << std::fixed << std::setprecision(1) << step_tokens_per_sec << " tok/s\n";
+                      << "Speed: " << std::fixed << std::setprecision(1) << step_tokens_per_sec << " tok/s\n"
+                      << std::flush;
         }
 
         // 7. Checkpoint Serialization
@@ -227,7 +228,8 @@ void Trainer::train() {
             if (model.save_weights(config.checkpoint_path, static_cast<uint32_t>(step), avg_step_loss)) {
                 std::cout << "  --> Checkpoint saved: " << config.checkpoint_path
                           << " (Step " << step << " | Loss: " << std::fixed << std::setprecision(4)
-                          << avg_step_loss << ")\n";
+                          << avg_step_loss << ")\n"
+                          << std::flush;
             }
         }
     }
