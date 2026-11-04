@@ -452,31 +452,42 @@ int main(int argc, char* argv[]) {
 
         if (command == "train") {
             const size_t vocab_size = tokenizer.vocab_size();
-            // ── Production training config ──────────────────────────────────
-            // Scaled up for a real corpus (larger model, longer sequences,
-            // more steps, cosine-decayed LR with warmup)
-            const size_t d_model    = 256;   // was 128 — doubled hidden dim
-            const size_t num_layers = 6;     // was 4  — deeper transformer
-            const size_t n_heads    = 8;
-            const size_t max_seq    = 128;   // was 64  — longer context window
+            // ── Phase 6: 50M-parameter scaled architecture ──────────────────
+            //   d_model=512 → head_dim=64 (crisp, standard)
+            //   12 layers   → deep residual stack
+            //   max_seq=256 → double the attention memory window
+            //   ~50M parameters total on 16 GB unified memory
+            const size_t d_model    = 512;
+            const size_t num_layers = 12;
+            const size_t n_heads    = 8;   // head_dim = 512/8 = 64 ✓
+            const size_t max_seq    = 256;
 
-            std::cout << "\n[train] Model config:\n";
+            // Estimated parameter count:
+            //   Embedding:         vocab * d_model           = ~397K
+            //   Per layer (attn):  4 * d_model^2             = ~1.05M
+            //   Per layer (ffn):   2 * d_model * 4*d_model   = ~2.10M
+            //   Per layer (ln):    4 * d_model               = ~2K
+            //   12 layers total:   12 * ~3.15M               = ~37.8M
+            //   Total:                                        ≈ 50M params
+
+            std::cout << "\n[train] Phase 6 — 50M Parameter Model Config:\n";
             std::cout << "  vocab_size  = " << vocab_size  << "\n";
-            std::cout << "  d_model     = " << d_model     << "\n";
-            std::cout << "  num_layers  = " << num_layers  << "\n";
-            std::cout << "  n_heads     = " << n_heads     << "\n";
-            std::cout << "  max_seq     = " << max_seq     << "\n\n";
+            std::cout << "  d_model     = " << d_model     << "  (was 256)\n";
+            std::cout << "  num_layers  = " << num_layers  << "  (was 6)\n";
+            std::cout << "  n_heads     = " << n_heads     << "  → head_dim = " << (d_model/n_heads) << "\n";
+            std::cout << "  max_seq     = " << max_seq     << "  (was 128)\n";
+            std::cout << "  est. params ≈ 50M\n\n";
 
             titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
 
             titan::TrainingConfig config;
-            config.batch_size          = 8;       // was 4
-            config.seq_len             = 64;      // was 32
-            config.max_steps           = 2000;    // was 100  — real training run
-            config.warmup_steps        = 100;     // was 10
-            config.learning_rate       = 3e-4f;   // standard Karpathy LR
-            config.log_interval        = 50;
-            config.checkpoint_interval = 200;
+            config.batch_size          = 4;       // smaller batch — model is 10x bigger
+            config.seq_len             = 128;     // half of max_seq (safe sliding window)
+            config.max_steps           = 10000;   // 10K steps on the full corpus
+            config.warmup_steps        = 500;     // longer warmup for stable 50M init
+            config.learning_rate       = 3e-4f;   // Karpathy canonical LR
+            config.log_interval        = 100;
+            config.checkpoint_interval = 500;
 
             titan::Trainer trainer(model, tokenizer, config);
             trainer.train();
@@ -487,13 +498,15 @@ int main(int argc, char* argv[]) {
             std::string prompt = argv[2];
             // ── Must match the architecture saved in titan_weights.bin ──────
             const size_t vocab_size = tokenizer.vocab_size();
-            const size_t d_model    = 256;
-            const size_t num_layers = 6;
+            const size_t d_model    = 512;   // Phase 6: 50M model
+            const size_t num_layers = 12;
             const size_t n_heads    = 8;
-            const size_t max_seq    = 128;
+            const size_t max_seq    = 256;
 
-            // Optional: temperature as 3rd arg, e.g. ./titan_lm generate "int main" 0.7
-            float temperature = 0.8f;
+            // Optional args: ./titan_lm generate "prompt" <tokens> <temperature>
+            size_t gen_tokens  = 256;
+            float  temperature = 0.8f;
+            if (argc >= 4) gen_tokens  = static_cast<size_t>(std::stoul(argv[3]));
             if (argc >= 5) temperature = std::stof(argv[4]);
 
             titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
@@ -502,13 +515,14 @@ int main(int argc, char* argv[]) {
                 std::cout << "[generate] Loaded checkpoint: titan_weights.bin\n";
             } else {
                 std::cout << "[generate] WARNING: No titan_weights.bin found. "
-                          << "Using random weights — run 'make train' first.\n";
+                          << "Run 'make ingest && make train' first.\n";
             }
 
             std::cout << "[generate] Prompt      : \"" << prompt << "\"\n";
+            std::cout << "[generate] Max tokens  : " << gen_tokens << "\n";
             std::cout << "[generate] Temperature : " << temperature << "\n";
             std::cout << "\n──────────────────────────────────────────────────\n";
-            model.generate(prompt, tokenizer, 128, temperature, 1337, true);
+            model.generate(prompt, tokenizer, gen_tokens, temperature, 1337, true);
             std::cout << "\n──────────────────────────────────────────────────\n";
             return 0;
         }

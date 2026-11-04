@@ -46,7 +46,8 @@ ingest_dir() {
     for dir in \
         "/Users/siluna/Desktop/titan-lm" \
         "/Users/siluna/Desktop/AeroDrop" \
-        "/Users/siluna/Desktop/AeroSec"
+        "/Users/siluna/Desktop/AeroSec" \
+        "/Users/siluna/titan_dataset"
     do
         [[ -d "$dir" ]] || continue
         for ext in "${exts[@]}"; do
@@ -56,6 +57,8 @@ ingest_dir() {
                 [[ "$f" == */build/CMakeFiles/* ]] && continue
                 [[ "$f" == */.gemini/* ]]        && continue
                 [[ "$f" == */node_modules/* ]]   && continue
+                # Skip test fixture binary blobs
+                [[ "$f" == */testdata/* ]]       && continue
 
                 # Skip empty files
                 [[ -s "$f" ]] || continue

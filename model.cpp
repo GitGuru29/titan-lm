@@ -1,6 +1,8 @@
 #include "model.hpp"
 #include "tokenizer.hpp"
 
+#include <algorithm>
+#include <numeric>
 #include <cmath>
 #include <iostream>
 #include <fstream>
@@ -581,9 +583,18 @@ std::string TitanModel::generate(
     std::mt19937_64 rng(seed);
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
 
+    // ── Top-P (nucleus) sampling parameters ──────────────────────────────
+    // p=0.90 means: sort tokens by P descending, keep only the smallest
+    // set whose cumulative probability ≥ 0.90, sample within that nucleus.
+    // This eliminates the long tail of implausible tokens that cause
+    // "subword soup" in a small model — dramatically improves coherence.
+    constexpr float TOP_P       = 0.90f;
+    constexpr float MIN_TEMP    = 1e-4f;
+
     std::string generated_text;
 
     for (size_t step = 0; step < max_new_tokens; ++step) {
+        // ── Sliding context window ───────────────────────────────────────
         std::vector<uint32_t> ctx_tokens;
         if (tokens.size() > max_seq_len) {
             ctx_tokens.assign(tokens.end() - max_seq_len, tokens.end());
@@ -591,53 +602,67 @@ std::string TitanModel::generate(
             ctx_tokens = tokens;
         }
 
+        // ── Forward pass → logits for the final position ─────────────────
         Tensor logits = forward(ctx_tokens);
         const size_t T = ctx_tokens.size();
         const float* next_logits = logits.data_ptr() + (T - 1) * vocab_size;
 
         TokenId next_token = 0;
-        if (temperature <= 1e-4f) {
-            float best_logit = next_logits[0];
+
+        // ── Greedy decode (temperature ≈ 0) ─────────────────────────────
+        if (temperature < MIN_TEMP) {
+            float best = next_logits[0];
             for (size_t c = 1; c < vocab_size; ++c) {
-                if (next_logits[c] > best_logit) {
-                    best_logit = next_logits[c];
-                    next_token = static_cast<TokenId>(c);
-                }
+                if (next_logits[c] > best) { best = next_logits[c]; next_token = static_cast<TokenId>(c); }
             }
         } else {
-            std::vector<float> scaled_logits(vocab_size);
-            float max_val = -1e9f;
-            for (size_t c = 0; c < vocab_size; ++c) {
-                float val = next_logits[c] / temperature;
-                scaled_logits[c] = val;
-                if (val > max_val) max_val = val;
-            }
-
+            // ── Step 1: temperature-scale logits ─────────────────────────
+            std::vector<float> probs(vocab_size);
+            float max_val = *std::max_element(next_logits, next_logits + vocab_size);
             float sum_exp = 0.0f;
             for (size_t c = 0; c < vocab_size; ++c) {
-                scaled_logits[c] = std::exp(scaled_logits[c] - max_val);
-                sum_exp += scaled_logits[c];
+                probs[c] = std::exp((next_logits[c] - max_val) / temperature);
+                sum_exp += probs[c];
             }
+            float inv_sum = 1.0f / (sum_exp > 0.0f ? sum_exp : 1e-12f);
+            for (size_t c = 0; c < vocab_size; ++c) probs[c] *= inv_sum;
 
-            float r_sum = 1.0f / (sum_exp > 0.0f ? sum_exp : 1e-12f);
-            for (size_t c = 0; c < vocab_size; ++c) {
-                scaled_logits[c] *= r_sum;
+            // ── Step 2: build sorted index by probability descending ──────
+            std::vector<size_t> idx(vocab_size);
+            std::iota(idx.begin(), idx.end(), 0);
+            std::partial_sort(idx.begin(), idx.end(), idx.end(),
+                [&probs](size_t a, size_t b){ return probs[a] > probs[b]; });
+
+            // ── Step 3: nucleus truncation — keep tokens until Σp ≥ TOP_P ─
+            float cum = 0.0f;
+            size_t nucleus_end = vocab_size;
+            for (size_t i = 0; i < vocab_size; ++i) {
+                cum += probs[idx[i]];
+                if (cum >= TOP_P) { nucleus_end = i + 1; break; }
             }
+            // Always keep at least 1 token
+            if (nucleus_end == 0) nucleus_end = 1;
 
+            // ── Step 4: re-normalise within the nucleus ───────────────────
+            float nucleus_sum = 0.0f;
+            for (size_t i = 0; i < nucleus_end; ++i) nucleus_sum += probs[idx[i]];
+            float inv_nsum = 1.0f / (nucleus_sum > 0.0f ? nucleus_sum : 1e-12f);
+
+            // ── Step 5: sample from the nucleus CDF ──────────────────────
             float r = dist(rng);
-            float cum_prob = 0.0f;
-            for (size_t c = 0; c < vocab_size; ++c) {
-                cum_prob += scaled_logits[c];
-                if (r <= cum_prob || c + 1 == vocab_size) {
-                    next_token = static_cast<TokenId>(c);
+            float cum_p = 0.0f;
+            next_token = static_cast<TokenId>(idx[0]); // fallback = top-1
+            for (size_t i = 0; i < nucleus_end; ++i) {
+                cum_p += probs[idx[i]] * inv_nsum;
+                if (r <= cum_p) {
+                    next_token = static_cast<TokenId>(idx[i]);
                     break;
                 }
             }
         }
 
-        if (next_token == EOS_TOKEN_ID) {
-            break;
-        }
+        // ── EOS guard ────────────────────────────────────────────────────
+        if (next_token == EOS_TOKEN_ID) break;
 
         tokens.push_back(next_token);
         std::string piece = tokenizer.token_to_piece(next_token);
