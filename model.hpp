@@ -12,6 +12,16 @@
 
 namespace titan {
 
+// Forward declarations
+class Tokenizer;
+
+// Parameter reference with weight decay flag for AdamW
+struct ParameterRef {
+    Tensor* tensor{nullptr};
+    std::string name;
+    bool weight_decay{true};
+};
+
 // ============================================================================
 // Layer Normalization Cache (Autograd Intermediate Buffer)
 // ============================================================================
@@ -192,6 +202,21 @@ public:
     void clear_cache() noexcept;
 
     [[nodiscard]] size_t parameter_count() const noexcept;
+    [[nodiscard]] std::vector<ParameterRef> get_parameters();
+
+    // Model checkpoint serialization
+    bool save_weights(const std::string& filepath, uint32_t step = 0, float loss = 0.0f) const;
+    bool load_weights(const std::string& filepath);
+
+    // Autoregressive token generation with real-time stdout streaming
+    std::string generate(
+        const std::string& prompt,
+        const Tokenizer& tokenizer,
+        size_t max_new_tokens = 64,
+        float temperature = 0.8f,
+        uint64_t seed = 42,
+        bool stream_to_stdout = true
+    );
 };
 
 } // namespace titan

@@ -10,16 +10,16 @@ CXXFLAGS    := -std=c++20 -O3 -mcpu=apple-m4 -DACCELERATE_NEW_LAPACK -framework 
 LDFLAGS     := -framework Accelerate
 
 TARGET      := titan_lm
-SRCS        := main.cpp tokenizer.cpp tensor.cpp attention.cpp model.cpp
+SRCS        := main.cpp tokenizer.cpp tensor.cpp attention.cpp model.cpp trainer.cpp
 OBJS        := $(SRCS:.cpp=.o)
-DEPS        := tokenizer.hpp tensor.hpp attention.hpp model.hpp
+DEPS        := tokenizer.hpp tensor.hpp attention.hpp model.hpp trainer.hpp
 
-.PHONY: all clean run benchmark test help
+.PHONY: all clean run benchmark test help train generate
 
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	@echo "==> Linking $(TARGET) [Apple Silicon M4 Native + Transformer Core]..."
+	@echo "==> Linking $(TARGET) [Apple Silicon M4 Native + Full Titan Engine]..."
 	$(CXX) $(CXXFLAGS) $(OBJS) -o $(TARGET) $(LDFLAGS)
 	@echo "==> Build complete: $(TARGET)"
 
@@ -32,21 +32,31 @@ run: $(TARGET)
 	./$(TARGET)
 
 test: $(TARGET)
-	@echo "==> Running Titan-LM Core Verification Suite (Phase 1, 2, 3 & 4)..."
+	@echo "==> Running Titan-LM Complete Verification Suite (Phases 1-5)..."
 	./$(TARGET)
 
+train: $(TARGET)
+	@echo "==> Launching Full Titan-LM Training Loop..."
+	./$(TARGET) train
+
+generate: $(TARGET)
+	@echo "==> Running Autoregressive Code Generation Stream..."
+	./$(TARGET) generate "template <typename T>"
+
 benchmark: $(TARGET)
-	@echo "==> Benchmarking Ingestion & Transformer Blocks on Apple Silicon M4..."
+	@echo "==> Benchmarking Ingestion & Transformer Execution on Apple Silicon M4..."
 	./$(TARGET) benchmark .
 
 clean:
-	@echo "==> Cleaning build artifacts and token binaries..."
+	@echo "==> Cleaning build artifacts and binaries..."
 	rm -f $(OBJS) $(TARGET) *.bin *.vocab *.txt
 
 help:
 	@echo "Titan-LM Build Targets:"
 	@echo "  make              - Compile optimized $(TARGET) binary"
-	@echo "  make run          - Execute $(TARGET) verification and pipeline demo"
-	@echo "  make test         - Run Phase 1, 2, 3 & 4 verification suite"
-	@echo "  make benchmark    - Benchmark ingestion throughput & Transformer blocks"
+	@echo "  make run          - Execute $(TARGET) verification suite"
+	@echo "  make test         - Run Phases 1-5 verification suite"
+	@echo "  make train        - Execute AdamW training loop on token dataset"
+	@echo "  make generate     - Run real-time streaming autoregressive code generation"
+	@echo "  make benchmark    - Benchmark system throughput"
 	@echo "  make clean        - Remove compiled objects and generated binaries"

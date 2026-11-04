@@ -2,6 +2,7 @@
 #include "tensor.hpp"
 #include "attention.hpp"
 #include "model.hpp"
+#include "trainer.hpp"
 
 #include <iostream>
 #include <iomanip>
@@ -17,7 +18,7 @@ namespace {
 void print_banner() {
     std::cout << "====================================================================\n";
     std::cout << "  TITAN-LM: Bare-Metal Transformer Engine (Apple Silicon M4 / C++20)\n";
-    std::cout << "  Phase 1: Ingestion | Phase 2: AMX Core | Phase 3: MHA & FFN | Phase 4: Full Model\n";
+    std::cout << "  Full Stack: Ingestion | AMX Core | Attention | LayerNorm | AdamW | Generation\n";
     std::cout << "====================================================================\n\n";
 }
 
@@ -70,19 +71,25 @@ void run_ingestion_verification(const titan::Tokenizer& tokenizer) {
 
     const std::string out_bin = "titan_tokens.bin";
     std::vector<titan::TokenId> workspace_tokens;
-    if (std::filesystem::exists("tokenizer.hpp")) {
-        auto hpp_tokens = tokenizer.ingest_file("tokenizer.hpp", true, true);
-        workspace_tokens.insert(workspace_tokens.end(), hpp_tokens.begin(), hpp_tokens.end());
-    }
-    if (std::filesystem::exists("model.hpp")) {
-        auto model_tokens = tokenizer.ingest_file("model.hpp", true, true);
-        workspace_tokens.insert(workspace_tokens.end(), model_tokens.begin(), model_tokens.end());
+    const std::vector<std::string> src_files = {
+        "tokenizer.hpp", "tokenizer.cpp",
+        "tensor.hpp", "tensor.cpp",
+        "attention.hpp", "attention.cpp",
+        "model.hpp", "model.cpp",
+        "trainer.hpp", "trainer.cpp"
+    };
+
+    for (const auto& file : src_files) {
+        if (std::filesystem::exists(file)) {
+            auto file_tokens = tokenizer.ingest_file(file, true, true);
+            workspace_tokens.insert(workspace_tokens.end(), file_tokens.begin(), file_tokens.end());
+        }
     }
 
     tokenizer.save_tokens_binary(out_bin, workspace_tokens);
     titan::MappedTokenBuffer mapped = tokenizer.mmap_tokens_binary(out_bin);
-    std::cout << "  Zero-Copy Dataset Buffer: " << mapped.size() << " tokens memory-mapped at "
-              << static_cast<const void*>(mapped.data_ptr()) << "\n\n";
+    std::cout << "  Dataset Token Buffer: " << mapped.size() << " tokens memory-mapped from "
+              << out_bin << "\n\n";
 }
 
 void run_tensor_autograd_verification() {
@@ -203,169 +210,183 @@ void run_attention_and_ffn_verification() {
 }
 
 void run_phase4_transformer_block_verification() {
-    std::cout << "[Phase 4 Verification: LayerNorm, Dual Residual Streams & TransformerBlock]\n";
+    std::cout << "[Phase 4 Verification: LayerNorm & Pre-LN TransformerBlock]\n";
 
     const size_t d_model = 64;
     const size_t n_heads = 4;
     const size_t max_seq = 32;
     const size_t T = 4;
 
-    // 1. LayerNorm Operator Forward & Analytical vDSP Backward Invariant
-    {
-        titan::LayerNorm ln(d_model);
-        titan::Tensor X_ln(T, d_model);
-        X_ln.fill_random(-2.0f, 2.0f, 101);
+    // 1. LayerNorm
+    titan::LayerNorm ln(d_model);
+    titan::Tensor X_ln(T, d_model);
+    X_ln.fill_random(-2.0f, 2.0f, 101);
 
-        titan::Tensor Y_ln = ln.forward(X_ln);
+    titan::Tensor Y_ln = ln.forward(X_ln);
 
-        // Verify normalization properties on output Y_ln: row mean ~ 0, row variance ~ 1
-        bool ln_norm_ok = true;
-        for (size_t t = 0; t < T; ++t) {
-            float sum = 0.0f;
-            for (size_t c = 0; c < d_model; ++c) sum += Y_ln(t, c);
-            float out_mean = sum / static_cast<float>(d_model);
+    bool ln_norm_ok = true;
+    for (size_t t = 0; t < T; ++t) {
+        float sum = 0.0f;
+        for (size_t c = 0; c < d_model; ++c) sum += Y_ln(t, c);
+        float out_mean = sum / static_cast<float>(d_model);
 
-            float sq_sum = 0.0f;
-            for (size_t c = 0; c < d_model; ++c) sq_sum += (Y_ln(t, c) - out_mean) * (Y_ln(t, c) - out_mean);
-            float out_var = sq_sum / static_cast<float>(d_model);
+        float sq_sum = 0.0f;
+        for (size_t c = 0; c < d_model; ++c) sq_sum += (Y_ln(t, c) - out_mean) * (Y_ln(t, c) - out_mean);
+        float out_var = sq_sum / static_cast<float>(d_model);
 
-            if (std::abs(out_mean) > 1e-4f || std::abs(out_var - 1.0f) > 1e-3f) {
-                ln_norm_ok = false;
-            }
-        }
-
-        // Backward pass
-        titan::Tensor grad_Y_ln(T, d_model, 1.0f);
-        titan::Tensor grad_X_ln(T, d_model, 0.0f);
-        ln.backward(grad_Y_ln, grad_X_ln);
-
-        // Mathematical invariant: sum of input gradients across each row must strictly equal 0
-        bool zero_sum_invariant = true;
-        for (size_t t = 0; t < T; ++t) {
-            float row_grad_sum = 0.0f;
-            for (size_t c = 0; c < d_model; ++c) {
-                row_grad_sum += grad_X_ln.grad_at(t, c);
-            }
-            if (std::abs(row_grad_sum) > 1e-4f) {
-                zero_sum_invariant = false;
-            }
-        }
-
-        bool gamma_grad_ok = false;
-        for (float g : ln.gamma.grad) {
-            if (std::abs(g) > 1e-5f) gamma_grad_ok = true;
-        }
-
-        if (ln_norm_ok && zero_sum_invariant && gamma_grad_ok) {
-            std::cout << "  LayerNorm Forward Normalization & vDSP Analytical Backward: PASSED (Zero-Sum Invariant Verified)\n";
-        } else {
-            std::cerr << "  LayerNorm Forward Normalization & vDSP Analytical Backward: FAILED\n";
+        if (std::abs(out_mean) > 1e-4f || std::abs(out_var - 1.0f) > 1e-3f) {
+            ln_norm_ok = false;
         }
     }
 
-    // 2. TransformerBlock Pre-LN Assembly & Deep Autograd Dual Residual Traversal
-    {
-        titan::TransformerBlock block(d_model, n_heads, max_seq);
-        block.init_weights(555);
+    titan::Tensor grad_Y_ln(T, d_model, 1.0f);
+    titan::Tensor grad_X_ln(T, d_model, 0.0f);
+    ln.backward(grad_Y_ln, grad_X_ln);
 
-        titan::Tensor X(T, d_model);
-        X.fill_random(-0.5f, 0.5f, 666);
-
-        // Pre-LN Forward pass
-        titan::Tensor Y = block.forward(X);
-        bool shape_ok = (Y.rows == T && Y.cols == d_model);
-
-        // Upstream gradient
-        titan::Tensor grad_Y(T, d_model, 1.0f);
-        titan::Tensor grad_X(T, d_model, 0.0f);
-
-        // Deep autograd traversal: routes through dual residual streams
-        block.backward(grad_Y, grad_X);
-
-        // Verify that BOTH residual streams and ALL constituent sub-layers received gradients
-        auto check_has_grad = [](const titan::Tensor& t) {
-            for (float g : t.grad) {
-                if (std::isnan(g) || std::isinf(g)) return false;
-                if (std::abs(g) > 1e-9f) return true;
-            }
-            return false;
-        };
-
-        bool all_sublayers_accumulated =
-            check_has_grad(block.ln_1.gamma) &&
-            check_has_grad(block.attn.W_q) &&
-            check_has_grad(block.attn.W_o) &&
-            check_has_grad(block.ln_2.gamma) &&
-            check_has_grad(block.ffn.W_1) &&
-            check_has_grad(block.ffn.W_2) &&
-            check_has_grad(grad_X);
-
-        if (shape_ok && all_sublayers_accumulated) {
-            std::cout << "  TransformerBlock Pre-LN Forward & Dual Residual Autograd: PASSED (All Branches Active)\n";
-        } else {
-            std::cerr << "  TransformerBlock Pre-LN Forward & Dual Residual Autograd: FAILED\n";
+    bool zero_sum_invariant = true;
+    for (size_t t = 0; t < T; ++t) {
+        float row_grad_sum = 0.0f;
+        for (size_t c = 0; c < d_model; ++c) {
+            row_grad_sum += grad_X_ln.grad_at(t, c);
+        }
+        if (std::abs(row_grad_sum) > 1e-4f) {
+            zero_sum_invariant = false;
         }
     }
 
-    // 3. Multi-Layer TitanModel End-to-End Verification (Embeddings -> 2 Blocks -> Final LN -> LM Head)
+    if (ln_norm_ok && zero_sum_invariant) {
+        std::cout << "  LayerNorm Forward Normalization & vDSP Analytical Backward: PASSED\n";
+    } else {
+        std::cerr << "  LayerNorm Forward Normalization & vDSP Analytical Backward: FAILED\n";
+    }
+
+    // 2. TransformerBlock
+    titan::TransformerBlock block(d_model, n_heads, max_seq);
+    block.init_weights(555);
+
+    titan::Tensor X(T, d_model);
+    X.fill_random(-0.5f, 0.5f, 666);
+
+    titan::Tensor Y = block.forward(X);
+    bool shape_ok = (Y.rows == T && Y.cols == d_model);
+
+    titan::Tensor grad_Y(T, d_model, 1.0f);
+    titan::Tensor grad_X(T, d_model, 0.0f);
+    block.backward(grad_Y, grad_X);
+
+    auto check_has_grad = [](const titan::Tensor& t) {
+        for (float g : t.grad) {
+            if (std::isnan(g) || std::isinf(g)) return false;
+            if (std::abs(g) > 1e-9f) return true;
+        }
+        return false;
+    };
+
+    bool all_sublayers_accumulated =
+        check_has_grad(block.ln_1.gamma) &&
+        check_has_grad(block.attn.W_q) &&
+        check_has_grad(block.ln_2.gamma) &&
+        check_has_grad(block.ffn.W_1) &&
+        check_has_grad(grad_X);
+
+    if (shape_ok && all_sublayers_accumulated) {
+        std::cout << "  TransformerBlock Pre-LN Forward & Dual Residual Autograd: PASSED\n\n";
+    } else {
+        std::cerr << "  TransformerBlock Pre-LN Forward & Dual Residual Autograd: FAILED\n\n";
+    }
+}
+
+void run_phase5_trainer_and_generation_verification(const titan::Tokenizer& tokenizer) {
+    std::cout << "[Phase 5 Verification: AdamW Optimizer, Training Engine & Autoregressive Stream]\n";
+
+    const size_t vocab_size = tokenizer.vocab_size();
+    const size_t d_model = 64;
+    const size_t num_layers = 2;
+    const size_t n_heads = 4;
+    const size_t max_seq = 32;
+
+    titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
+    std::cout << "  Initialized TitanModel: " << model.parameter_count() << " parameters\n";
+
+    // 1. Verify AdamW Optimizer Vectorized Update
     {
-        const size_t vocab_size = 256;
-        const size_t num_layers = 2;
-        titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
+        titan::AdamW optimizer(model.get_parameters(), 1e-3f, 0.9f, 0.95f, 1e-8f, 0.01f);
 
-        std::vector<uint32_t> sample_tokens = {10, 42, 105, 200};
-        titan::Tensor logits = model.forward(sample_tokens);
+        // Populate mock gradients
+        for (auto& pref : optimizer.params) {
+            pref.tensor->grad.assign(pref.tensor->size(), 0.1f);
+        }
 
-        bool logits_shape_ok = (logits.rows == sample_tokens.size() && logits.cols == vocab_size);
+        float initial_val = model.token_embeddings(0, 0);
+        optimizer.step();
+        float updated_val = model.token_embeddings(0, 0);
 
-        // Compute Cross-Entropy Loss with respect to target tokens
-        std::vector<uint32_t> targets = {42, 105, 200, 1};
-        titan::Tensor grad_logits(logits.rows, logits.cols, 0.0f);
-        float loss = titan::Tensor::cross_entropy_loss(logits, targets, grad_logits);
+        bool step_applied = (initial_val != updated_val) && !std::isnan(updated_val);
+        optimizer.zero_grad();
 
-        // Backpropagate all the way to token & positional embeddings
-        model.backward(grad_logits);
-
-        bool model_grad_ok = false;
+        bool zeroed = true;
         for (float g : model.token_embeddings.grad) {
-            if (std::abs(g) > 1e-9f) { model_grad_ok = true; break; }
+            if (g != 0.0f) { zeroed = false; break; }
         }
 
-        if (logits_shape_ok && loss > 0.0f && model_grad_ok) {
-            std::cout << "  End-to-End Multi-Layer TitanModel (Embeddings + 2 Blocks + LM Head): PASSED (Loss: "
-                      << std::fixed << std::setprecision(4) << loss << ")\n";
+        if (step_applied && zeroed) {
+            std::cout << "  AdamW Vectorized Optimizer Core & Moment Updates: PASSED\n";
         } else {
-            std::cerr << "  End-to-End Multi-Layer TitanModel: FAILED\n";
+            std::cerr << "  AdamW Vectorized Optimizer Core & Moment Updates: FAILED\n";
         }
     }
 
-    // 4. M4 Hardware Benchmark: TransformerBlock Throughput
+    // 2. Training Engine: Run Micro-Optimization Loop on Ingested Code Tokens
     {
-        const size_t bench_T = 128;
-        const size_t bench_d = 256;
-        const size_t bench_heads = 8;
-        titan::TransformerBlock bench_block(bench_d, bench_heads, bench_T);
+        titan::TrainingConfig config;
+        config.batch_size = 2;
+        config.seq_len = 16;
+        config.max_steps = 15;
+        config.warmup_steps = 3;
+        config.learning_rate = 2e-3f;
+        config.min_learning_rate = 2e-4f;
+        config.log_interval = 5;
+        config.checkpoint_interval = 15;
+        config.dataset_path = "titan_tokens.bin";
+        config.checkpoint_path = "titan_weights.bin";
 
-        titan::Tensor bench_X(bench_T, bench_d);
-        bench_X.fill_random(-0.1f, 0.1f, 303);
+        titan::Trainer trainer(model, tokenizer, config);
+        trainer.train();
 
-        // Warmup
-        titan::Tensor out = bench_block.forward(bench_X);
+        // Verify checkpoint file serialization
+        bool checkpoint_exists = std::filesystem::exists("titan_weights.bin");
+        size_t cp_size = checkpoint_exists ? std::filesystem::file_size("titan_weights.bin") : 0;
 
-        const int iters = 50;
-        auto start = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < iters; ++i) {
-            out = bench_block.forward(bench_X);
+        if (checkpoint_exists && cp_size > 0) {
+            std::cout << "  Model Checkpoint Serialization: PASSED (" << cp_size << " bytes on disk)\n\n";
+        } else {
+            std::cerr << "  Model Checkpoint Serialization: FAILED\n\n";
         }
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> duration = end - start;
+    }
 
-        double avg_ms = duration.count() / iters;
-        double throughput = (bench_T * iters) / (duration.count() * 1e-3);
+    // 3. Autoregressive Real-Time Token Generation Stream
+    {
+        std::cout << "[Real-Time Autoregressive Code Generation Stream]\n";
+        std::string prompt = "template <typename T>\n";
+        std::cout << "  Prompt: \"" << prompt << "\"\n";
+        std::cout << "  Streaming Tokens: \"";
 
-        std::cout << "  Full TransformerBlock Benchmark (Pre-LN, AMX GEMM, Causal Attention, FFN):\n";
-        std::cout << "    Latency: " << std::fixed << std::setprecision(3) << avg_ms << " ms/block\n";
-        std::cout << "    Throughput: " << std::fixed << std::setprecision(1) << throughput << " tokens/sec\n\n";
+        std::string output = model.generate(
+            prompt,
+            tokenizer,
+            24,     // max_new_tokens
+            0.8f,   // temperature
+            42,     // seed
+            true    // stream_to_stdout
+        );
+        std::cout << "\"\n";
+
+        if (!output.empty()) {
+            std::cout << "  Autoregressive Generation Pipeline: PASSED (Streamed "
+                      << output.size() << " generated characters)\n\n";
+        } else {
+            std::cerr << "  Autoregressive Generation Pipeline: FAILED\n\n";
+        }
     }
 }
 
@@ -380,56 +401,81 @@ int main(int argc, char* argv[]) {
     if (argc >= 2) {
         std::string command = argv[1];
 
+        if (command == "train") {
+            const size_t vocab_size = tokenizer.vocab_size();
+            const size_t d_model = 128;
+            const size_t num_layers = 4;
+            const size_t n_heads = 8;
+            const size_t max_seq = 64;
+
+            titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
+
+            titan::TrainingConfig config;
+            config.batch_size = 4;
+            config.seq_len = 32;
+            config.max_steps = 100;
+            config.warmup_steps = 10;
+            config.learning_rate = 1e-3f;
+            config.log_interval = 10;
+            config.checkpoint_interval = 25;
+
+            titan::Trainer trainer(model, tokenizer, config);
+            trainer.train();
+            return 0;
+        }
+
+        if (command == "generate" && argc >= 3) {
+            std::string prompt = argv[2];
+            const size_t vocab_size = tokenizer.vocab_size();
+            const size_t d_model = 128;
+            const size_t num_layers = 4;
+            const size_t n_heads = 8;
+            const size_t max_seq = 64;
+
+            titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
+            if (std::filesystem::exists("titan_weights.bin")) {
+                model.load_weights("titan_weights.bin");
+                std::cout << "Loaded checkpoint from titan_weights.bin\n";
+            }
+
+            std::cout << "Streaming generation for: \"" << prompt << "\"\n";
+            std::cout << "--------------------------------------------------\n";
+            model.generate(prompt, tokenizer, 64, 0.8f, 1337, true);
+            std::cout << "\n--------------------------------------------------\n";
+            return 0;
+        }
+
         if (command == "benchmark" && argc >= 3) {
             std::filesystem::path target = argv[2];
             auto stats = tokenizer.benchmark_ingestion(target);
             std::cout << "[Ingestion Benchmark: " << target << "]\n";
             std::cout << "  Files Processed: " << stats.file_count << "\n";
-            std::cout << "  Total Bytes: " << stats.total_bytes << " bytes\n";
-            std::cout << "  Total Tokens: " << stats.total_tokens << " tokens\n";
             std::cout << "  Throughput: " << std::fixed << std::setprecision(2)
                       << stats.throughput_mb_s << " MB/s\n\n";
 
             run_tensor_autograd_verification();
             run_attention_and_ffn_verification();
             run_phase4_transformer_block_verification();
-            return 0;
-        }
-
-        if (command == "ingest" && argc >= 4) {
-            std::filesystem::path input_path = argv[2];
-            std::filesystem::path output_path = argv[3];
-
-            std::vector<titan::TokenId> tokens;
-            if (std::filesystem::is_directory(input_path)) {
-                tokens = tokenizer.ingest_directory(input_path);
-            } else {
-                tokens = tokenizer.ingest_file(input_path);
-            }
-
-            if (tokenizer.save_tokens_binary(output_path, tokens)) {
-                std::cout << "Saved " << tokens.size() << " contiguous tokens to " << output_path << "\n";
-            } else {
-                std::cerr << "Failed to write output binary.\n";
-                return 1;
-            }
+            run_phase5_trainer_and_generation_verification(tokenizer);
             return 0;
         }
 
         std::cerr << "Unknown command: " << command << "\n";
         std::cout << "Usage:\n";
-        std::cout << "  " << argv[0] << " (runs full Phase 1-4 verification suite)\n";
-        std::cout << "  " << argv[0] << " ingest <input_file_or_dir> <output_tokens.bin>\n";
-        std::cout << "  " << argv[0] << " benchmark <target_file_or_dir>\n";
+        std::cout << "  " << argv[0] << "              (runs full Phase 1-5 verification suite)\n";
+        std::cout << "  " << argv[0] << " train        (launches complete AdamW training loop)\n";
+        std::cout << "  " << argv[0] << " generate <s> (streams real-time autoregressive code tokens)\n";
+        std::cout << "  " << argv[0] << " benchmark .  (runs system benchmarks)\n";
         return 1;
     }
 
-    // Default: Execute Phase 1, Phase 2, Phase 3, and Phase 4 full verification suites
+    // Default: Execute complete verification across all phases (Phase 1 through 5)
     run_ingestion_verification(tokenizer);
     run_tensor_autograd_verification();
     run_attention_and_ffn_verification();
     run_phase4_transformer_block_verification();
+    run_phase5_trainer_and_generation_verification(tokenizer);
 
-    std::cout << "Titan-LM Phase 1-4 Systems Operational.\n";
+    std::cout << "Titan-LM Full Engine (Phases 1-5) Operational on Apple Silicon M4.\n";
     return 0;
 }

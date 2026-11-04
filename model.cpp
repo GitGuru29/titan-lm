@@ -1,7 +1,10 @@
 #include "model.hpp"
+#include "tokenizer.hpp"
 
 #include <cmath>
 #include <iostream>
+#include <fstream>
+#include <random>
 #include <stdexcept>
 #include <cassert>
 #include <Accelerate/Accelerate.h>
@@ -455,6 +458,197 @@ void TitanModel::backward(const Tensor& grad_logits) {
         vDSP_vadd(tok_grad, 1, dx, 1, tok_grad, 1, d_model);
         vDSP_vadd(pos_grad, 1, dx, 1, pos_grad, 1, d_model);
     }
+}
+
+std::vector<ParameterRef> TitanModel::get_parameters() {
+    std::vector<ParameterRef> params;
+    params.push_back({&token_embeddings, "token_embeddings", true});
+    params.push_back({&pos_embeddings, "pos_embeddings", true});
+
+    for (size_t l = 0; l < layers.size(); ++l) {
+        std::string pfx = "layer_" + std::to_string(l) + ".";
+        params.push_back({&layers[l].ln_1.gamma, pfx + "ln_1.gamma", false});
+        params.push_back({&layers[l].ln_1.beta, pfx + "ln_1.beta", false});
+
+        params.push_back({&layers[l].attn.W_q, pfx + "attn.W_q", true});
+        params.push_back({&layers[l].attn.b_q, pfx + "attn.b_q", false});
+        params.push_back({&layers[l].attn.W_k, pfx + "attn.W_k", true});
+        params.push_back({&layers[l].attn.b_k, pfx + "attn.b_k", false});
+        params.push_back({&layers[l].attn.W_v, pfx + "attn.W_v", true});
+        params.push_back({&layers[l].attn.b_v, pfx + "attn.b_v", false});
+        params.push_back({&layers[l].attn.W_o, pfx + "attn.W_o", true});
+        params.push_back({&layers[l].attn.b_o, pfx + "attn.b_o", false});
+
+        params.push_back({&layers[l].ln_2.gamma, pfx + "ln_2.gamma", false});
+        params.push_back({&layers[l].ln_2.beta, pfx + "ln_2.beta", false});
+
+        params.push_back({&layers[l].ffn.W_1, pfx + "ffn.W_1", true});
+        params.push_back({&layers[l].ffn.b_1, pfx + "ffn.b_1", false});
+        params.push_back({&layers[l].ffn.W_2, pfx + "ffn.W_2", true});
+        params.push_back({&layers[l].ffn.b_2, pfx + "ffn.b_2", false});
+    }
+
+    params.push_back({&final_ln.gamma, "final_ln.gamma", false});
+    params.push_back({&final_ln.beta, "final_ln.beta", false});
+    params.push_back({&lm_head, "lm_head", true});
+
+    return params;
+}
+
+namespace {
+struct alignas(8) CheckpointHeader {
+    uint32_t magic{0x54495457}; // 'TITW'
+    uint32_t version{1};
+    uint64_t total_params{0};
+    uint32_t vocab_size{0};
+    uint32_t d_model{0};
+    uint32_t num_layers{0};
+    uint32_t n_heads{0};
+    uint32_t max_seq_len{0};
+    uint32_t step{0};
+    float loss{0.0f};
+    uint32_t reserved{0};
+};
+} // anonymous namespace
+
+bool TitanModel::save_weights(const std::string& filepath, uint32_t step, float loss) const {
+    std::ofstream out(filepath, std::ios::binary);
+    if (!out.is_open()) return false;
+
+    CheckpointHeader header{
+        .magic = 0x54495457,
+        .version = 1,
+        .total_params = static_cast<uint64_t>(parameter_count()),
+        .vocab_size = static_cast<uint32_t>(vocab_size),
+        .d_model = static_cast<uint32_t>(d_model),
+        .num_layers = static_cast<uint32_t>(num_layers),
+        .n_heads = static_cast<uint32_t>(n_heads),
+        .max_seq_len = static_cast<uint32_t>(max_seq_len),
+        .step = step,
+        .loss = loss,
+        .reserved = 0
+    };
+
+    out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+
+    auto params = const_cast<TitanModel*>(this)->get_parameters();
+    for (const auto& p : params) {
+        out.write(
+            reinterpret_cast<const char*>(p.tensor->data.data()),
+            static_cast<std::streamsize>(p.tensor->bytes())
+        );
+    }
+
+    return out.good();
+}
+
+bool TitanModel::load_weights(const std::string& filepath) {
+    std::ifstream in(filepath, std::ios::binary);
+    if (!in.is_open()) return false;
+
+    CheckpointHeader header{};
+    in.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (!in.good() || header.magic != 0x54495457) return false;
+
+    if (header.vocab_size != vocab_size || header.d_model != d_model ||
+        header.num_layers != num_layers || header.n_heads != n_heads) {
+        return false;
+    }
+
+    auto params = get_parameters();
+    for (const auto& p : params) {
+        in.read(
+            reinterpret_cast<char*>(p.tensor->data.data()),
+            static_cast<std::streamsize>(p.tensor->bytes())
+        );
+        if (!in.good()) return false;
+    }
+
+    return true;
+}
+
+std::string TitanModel::generate(
+    const std::string& prompt,
+    const Tokenizer& tokenizer,
+    size_t max_new_tokens,
+    float temperature,
+    uint64_t seed,
+    bool stream_to_stdout
+) {
+    std::vector<TokenId> tokens = tokenizer.encode(prompt, true, false);
+    if (tokens.empty()) tokens.push_back(BOS_TOKEN_ID);
+
+    std::mt19937_64 rng(seed);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
+    std::string generated_text;
+
+    for (size_t step = 0; step < max_new_tokens; ++step) {
+        std::vector<uint32_t> ctx_tokens;
+        if (tokens.size() > max_seq_len) {
+            ctx_tokens.assign(tokens.end() - max_seq_len, tokens.end());
+        } else {
+            ctx_tokens = tokens;
+        }
+
+        Tensor logits = forward(ctx_tokens);
+        const size_t T = ctx_tokens.size();
+        const float* next_logits = logits.data_ptr() + (T - 1) * vocab_size;
+
+        TokenId next_token = 0;
+        if (temperature <= 1e-4f) {
+            float best_logit = next_logits[0];
+            for (size_t c = 1; c < vocab_size; ++c) {
+                if (next_logits[c] > best_logit) {
+                    best_logit = next_logits[c];
+                    next_token = static_cast<TokenId>(c);
+                }
+            }
+        } else {
+            std::vector<float> scaled_logits(vocab_size);
+            float max_val = -1e9f;
+            for (size_t c = 0; c < vocab_size; ++c) {
+                float val = next_logits[c] / temperature;
+                scaled_logits[c] = val;
+                if (val > max_val) max_val = val;
+            }
+
+            float sum_exp = 0.0f;
+            for (size_t c = 0; c < vocab_size; ++c) {
+                scaled_logits[c] = std::exp(scaled_logits[c] - max_val);
+                sum_exp += scaled_logits[c];
+            }
+
+            float r_sum = 1.0f / (sum_exp > 0.0f ? sum_exp : 1e-12f);
+            for (size_t c = 0; c < vocab_size; ++c) {
+                scaled_logits[c] *= r_sum;
+            }
+
+            float r = dist(rng);
+            float cum_prob = 0.0f;
+            for (size_t c = 0; c < vocab_size; ++c) {
+                cum_prob += scaled_logits[c];
+                if (r <= cum_prob || c + 1 == vocab_size) {
+                    next_token = static_cast<TokenId>(c);
+                    break;
+                }
+            }
+        }
+
+        if (next_token == EOS_TOKEN_ID) {
+            break;
+        }
+
+        tokens.push_back(next_token);
+        std::string piece = tokenizer.token_to_piece(next_token);
+        generated_text.append(piece);
+
+        if (stream_to_stdout) {
+            std::cout << piece << std::flush;
+        }
+    }
+
+    return generated_text;
 }
 
 } // namespace titan
