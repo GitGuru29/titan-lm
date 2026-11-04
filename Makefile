@@ -6,20 +6,20 @@
 # ==============================================================================
 
 CXX         := clang++
-CXXFLAGS    := -std=c++20 -O3 -mcpu=apple-m4 -framework Accelerate -Wall -Wextra -Wpedantic -Wshadow -Qunused-arguments
+CXXFLAGS    := -std=c++20 -O3 -mcpu=apple-m4 -DACCELERATE_NEW_LAPACK -framework Accelerate -Wall -Wextra -Wpedantic -Wshadow -Qunused-arguments
 LDFLAGS     := -framework Accelerate
 
 TARGET      := titan_lm
-SRCS        := main.cpp tokenizer.cpp
+SRCS        := main.cpp tokenizer.cpp tensor.cpp
 OBJS        := $(SRCS:.cpp=.o)
-DEPS        := tokenizer.hpp
+DEPS        := tokenizer.hpp tensor.hpp
 
 .PHONY: all clean run benchmark test help
 
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	@echo "==> Linking $(TARGET) [Apple Silicon M4 Native]..."
+	@echo "==> Linking $(TARGET) [Apple Silicon M4 Native + Accelerate AMX]..."
 	$(CXX) $(CXXFLAGS) $(OBJS) -o $(TARGET) $(LDFLAGS)
 	@echo "==> Build complete: $(TARGET)"
 
@@ -32,11 +32,11 @@ run: $(TARGET)
 	./$(TARGET)
 
 test: $(TARGET)
-	@echo "==> Running Phase 1 Ingestion Verification Suite..."
+	@echo "==> Running Titan-LM Core Verification Suite (Phase 1 & Phase 2)..."
 	./$(TARGET)
 
 benchmark: $(TARGET)
-	@echo "==> Benchmarking Ingestion on workspace..."
+	@echo "==> Benchmarking Ingestion & AMX GEMM on Apple Silicon M4..."
 	./$(TARGET) benchmark .
 
 clean:
@@ -47,6 +47,6 @@ help:
 	@echo "Titan-LM Build Targets:"
 	@echo "  make              - Compile optimized $(TARGET) binary"
 	@echo "  make run          - Execute $(TARGET) verification and pipeline demo"
-	@echo "  make test         - Run Phase 1 ingestion tests"
-	@echo "  make benchmark    - Benchmark ingestion throughput on workspace"
+	@echo "  make test         - Run Phase 1 & 2 verification suite"
+	@echo "  make benchmark    - Benchmark ingestion throughput & AMX GEMM"
 	@echo "  make clean        - Remove compiled objects and generated binaries"
