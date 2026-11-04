@@ -1,0 +1,10 @@
+# Binaries and object files
+*.o
+*.bin
+*.vocab
+*.txt
+titan_lm
+
+# OS artifacts
+.DS_Store
+
