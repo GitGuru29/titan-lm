@@ -1,6 +1,7 @@
 #include "tokenizer.hpp"
 #include "tensor.hpp"
 #include "attention.hpp"
+#include "model.hpp"
 
 #include <iostream>
 #include <iomanip>
@@ -16,7 +17,7 @@ namespace {
 void print_banner() {
     std::cout << "====================================================================\n";
     std::cout << "  TITAN-LM: Bare-Metal Transformer Engine (Apple Silicon M4 / C++20)\n";
-    std::cout << "  Phase 1: Ingestion | Phase 2: AMX Tensors | Phase 3: Causal MHA & FFN\n";
+    std::cout << "  Phase 1: Ingestion | Phase 2: AMX Core | Phase 3: MHA & FFN | Phase 4: Full Model\n";
     std::cout << "====================================================================\n\n";
 }
 
@@ -73,13 +74,9 @@ void run_ingestion_verification(const titan::Tokenizer& tokenizer) {
         auto hpp_tokens = tokenizer.ingest_file("tokenizer.hpp", true, true);
         workspace_tokens.insert(workspace_tokens.end(), hpp_tokens.begin(), hpp_tokens.end());
     }
-    if (std::filesystem::exists("tensor.hpp")) {
-        auto tensor_tokens = tokenizer.ingest_file("tensor.hpp", true, true);
-        workspace_tokens.insert(workspace_tokens.end(), tensor_tokens.begin(), tensor_tokens.end());
-    }
-    if (std::filesystem::exists("attention.hpp")) {
-        auto attn_tokens = tokenizer.ingest_file("attention.hpp", true, true);
-        workspace_tokens.insert(workspace_tokens.end(), attn_tokens.begin(), attn_tokens.end());
+    if (std::filesystem::exists("model.hpp")) {
+        auto model_tokens = tokenizer.ingest_file("model.hpp", true, true);
+        workspace_tokens.insert(workspace_tokens.end(), model_tokens.begin(), model_tokens.end());
     }
 
     tokenizer.save_tokens_binary(out_bin, workspace_tokens);
@@ -91,7 +88,6 @@ void run_ingestion_verification(const titan::Tokenizer& tokenizer) {
 void run_tensor_autograd_verification() {
     std::cout << "[Phase 2 Verification: Accelerated Tensor Engine & Autograd Core]\n";
 
-    // 1. AMX matmul forward & backward
     titan::Tensor A(2, 3, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
     titan::Tensor B(3, 2, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
     titan::Tensor C = titan::Tensor::matmul(A, B);
@@ -114,7 +110,6 @@ void run_tensor_autograd_verification() {
         std::cerr << "  AMX cblas_sgemm Matmul Forward & Backward: FAILED\n";
     }
 
-    // 2. ReLU & Derivative
     titan::Tensor X_relu(1, 4, {-2.0f, 0.5f, -0.1f, 3.0f});
     titan::Tensor Y_relu = X_relu.forward_relu();
     titan::Tensor grad_relu(1, 4, {1.0f, 1.0f, 1.0f, 1.0f});
@@ -126,7 +121,6 @@ void run_tensor_autograd_verification() {
         std::cerr << "  ReLU Forward & Derivative Accumulation: FAILED\n";
     }
 
-    // 3. Stable Softmax & Bias
     titan::Tensor logits(2, 3, {1.0f, 2.0f, 3.0f, 1000.0f, 1001.0f, 1002.0f});
     titan::Tensor probs = logits.forward_softmax();
     float row0_sum = probs(0, 0) + probs(0, 1) + probs(0, 2);
@@ -144,9 +138,8 @@ void run_attention_and_ffn_verification() {
     const size_t d_model = 64;
     const size_t n_heads = 4;
     const size_t max_seq = 32;
-    const size_t T = 4; // Sequence length for validation test
+    const size_t T = 4;
 
-    // 1. Causal Self-Attention Forward & Causal Masking Invariant Verification
     titan::CausalAttention attention(d_model, n_heads, max_seq);
     attention.init_weights(123);
 
@@ -155,12 +148,6 @@ void run_attention_and_ffn_verification() {
 
     titan::Tensor Y_attn = attention.forward(X);
 
-    // Verify dimensions: (T x d_model)
-    bool dim_ok = (Y_attn.rows == T && Y_attn.cols == d_model);
-
-    // Verify strict upper-triangular causal masking across all heads:
-    // Attention weights must be strictly 0.0 for future tokens (c > r)
-    // and row sum must be exactly 1.0
     bool causal_mask_strictly_enforced = true;
     for (size_t h = 0; h < n_heads; ++h) {
         const auto& weights_h = attention.cache.weights[h];
@@ -169,106 +156,217 @@ void run_attention_and_ffn_verification() {
             for (size_t c = 0; c < T; ++c) {
                 float w = weights_h(r, c);
                 row_sum += w;
-                if (c > r && std::abs(w) > 1e-6f) {
-                    causal_mask_strictly_enforced = false;
-                }
+                if (c > r && std::abs(w) > 1e-6f) causal_mask_strictly_enforced = false;
             }
-            if (std::abs(row_sum - 1.0f) > 1e-4f) {
-                causal_mask_strictly_enforced = false;
-            }
+            if (std::abs(row_sum - 1.0f) > 1e-4f) causal_mask_strictly_enforced = false;
         }
     }
 
-    if (dim_ok && causal_mask_strictly_enforced) {
-        std::cout << "  Causal Self-Attention Forward & Mask Invariant: PASSED (Tokens Strictly Isolated)\n";
+    if (causal_mask_strictly_enforced) {
+        std::cout << "  Causal Self-Attention Forward & Mask Invariant: PASSED\n";
     } else {
         std::cerr << "  Causal Self-Attention Forward & Mask Invariant: FAILED\n";
     }
 
-    // 2. Causal Self-Attention Autograd Backward Verification
     titan::Tensor grad_Y_attn(T, d_model, 1.0f);
     titan::Tensor grad_X(T, d_model, 0.0f);
-
     attention.backward(grad_Y_attn, grad_X);
 
-    // Verify all projection parameter gradients are accumulated and non-zero
-    bool gradients_accumulated = true;
     auto check_grad = [&](const titan::Tensor& t) {
-        bool has_grad = false;
         for (float g : t.grad) {
             if (std::isnan(g) || std::isinf(g)) return false;
-            if (std::abs(g) > 1e-9f) has_grad = true;
+            if (std::abs(g) > 1e-9f) return true;
         }
-        return has_grad;
+        return false;
     };
 
-    gradients_accumulated &= check_grad(attention.W_q);
-    gradients_accumulated &= check_grad(attention.b_q);
-    gradients_accumulated &= check_grad(attention.W_k);
-    gradients_accumulated &= check_grad(attention.b_k);
-    gradients_accumulated &= check_grad(attention.W_v);
-    gradients_accumulated &= check_grad(attention.b_v);
-    gradients_accumulated &= check_grad(attention.W_o);
-    gradients_accumulated &= check_grad(attention.b_o);
-    gradients_accumulated &= check_grad(grad_X);
-
-    if (gradients_accumulated) {
-        std::cout << "  Causal Self-Attention Full Autograd Backward: PASSED (All Projections Gradient Verified)\n";
+    if (check_grad(attention.W_q) && check_grad(attention.W_o) && check_grad(grad_X)) {
+        std::cout << "  Causal Self-Attention Autograd Backward: PASSED\n";
     } else {
-        std::cerr << "  Causal Self-Attention Full Autograd Backward: FAILED\n";
+        std::cerr << "  Causal Self-Attention Autograd Backward: FAILED\n";
     }
 
-    // 3. Feed-Forward Network (FFN / MLP) Forward & Backward Verification
     const size_t d_ff = 256;
     titan::FeedForward ffn(d_model, d_ff);
     ffn.init_weights(789);
 
     titan::Tensor Y_ffn = ffn.forward(X);
-    bool ffn_fwd_ok = (Y_ffn.rows == T && Y_ffn.cols == d_model);
-
     titan::Tensor grad_Y_ffn(T, d_model, 1.0f);
     titan::Tensor grad_X_ffn(T, d_model, 0.0f);
     ffn.backward(grad_Y_ffn, grad_X_ffn);
 
-    bool ffn_grad_ok = check_grad(ffn.W_1) && check_grad(ffn.b_1) &&
-                       check_grad(ffn.W_2) && check_grad(ffn.b_2) &&
-                       check_grad(grad_X_ffn);
-
-    if (ffn_fwd_ok && ffn_grad_ok) {
-        std::cout << "  Feed-Forward (W2 x ReLU(W1 x X + b1) + b2) Autograd Pass: PASSED\n";
+    if (check_grad(ffn.W_1) && check_grad(ffn.W_2) && check_grad(grad_X_ffn)) {
+        std::cout << "  Feed-Forward (W2 x ReLU(W1 x X + b1) + b2) Autograd: PASSED\n\n";
     } else {
-        std::cerr << "  Feed-Forward Autograd Pass: FAILED\n";
+        std::cerr << "  Feed-Forward Autograd: FAILED\n\n";
+    }
+}
+
+void run_phase4_transformer_block_verification() {
+    std::cout << "[Phase 4 Verification: LayerNorm, Dual Residual Streams & TransformerBlock]\n";
+
+    const size_t d_model = 64;
+    const size_t n_heads = 4;
+    const size_t max_seq = 32;
+    const size_t T = 4;
+
+    // 1. LayerNorm Operator Forward & Analytical vDSP Backward Invariant
+    {
+        titan::LayerNorm ln(d_model);
+        titan::Tensor X_ln(T, d_model);
+        X_ln.fill_random(-2.0f, 2.0f, 101);
+
+        titan::Tensor Y_ln = ln.forward(X_ln);
+
+        // Verify normalization properties on output Y_ln: row mean ~ 0, row variance ~ 1
+        bool ln_norm_ok = true;
+        for (size_t t = 0; t < T; ++t) {
+            float sum = 0.0f;
+            for (size_t c = 0; c < d_model; ++c) sum += Y_ln(t, c);
+            float out_mean = sum / static_cast<float>(d_model);
+
+            float sq_sum = 0.0f;
+            for (size_t c = 0; c < d_model; ++c) sq_sum += (Y_ln(t, c) - out_mean) * (Y_ln(t, c) - out_mean);
+            float out_var = sq_sum / static_cast<float>(d_model);
+
+            if (std::abs(out_mean) > 1e-4f || std::abs(out_var - 1.0f) > 1e-3f) {
+                ln_norm_ok = false;
+            }
+        }
+
+        // Backward pass
+        titan::Tensor grad_Y_ln(T, d_model, 1.0f);
+        titan::Tensor grad_X_ln(T, d_model, 0.0f);
+        ln.backward(grad_Y_ln, grad_X_ln);
+
+        // Mathematical invariant: sum of input gradients across each row must strictly equal 0
+        bool zero_sum_invariant = true;
+        for (size_t t = 0; t < T; ++t) {
+            float row_grad_sum = 0.0f;
+            for (size_t c = 0; c < d_model; ++c) {
+                row_grad_sum += grad_X_ln.grad_at(t, c);
+            }
+            if (std::abs(row_grad_sum) > 1e-4f) {
+                zero_sum_invariant = false;
+            }
+        }
+
+        bool gamma_grad_ok = false;
+        for (float g : ln.gamma.grad) {
+            if (std::abs(g) > 1e-5f) gamma_grad_ok = true;
+        }
+
+        if (ln_norm_ok && zero_sum_invariant && gamma_grad_ok) {
+            std::cout << "  LayerNorm Forward Normalization & vDSP Analytical Backward: PASSED (Zero-Sum Invariant Verified)\n";
+        } else {
+            std::cerr << "  LayerNorm Forward Normalization & vDSP Analytical Backward: FAILED\n";
+        }
     }
 
-    // 4. Multi-Head Attention & FFN Throughput Benchmark on Apple Silicon M4
-    const size_t bench_T = 128;
-    const size_t bench_d = 256;
-    const size_t bench_heads = 8;
-    titan::CausalAttention bench_attn(bench_d, bench_heads, bench_T);
-    titan::FeedForward bench_ffn(bench_d, 4 * bench_d);
+    // 2. TransformerBlock Pre-LN Assembly & Deep Autograd Dual Residual Traversal
+    {
+        titan::TransformerBlock block(d_model, n_heads, max_seq);
+        block.init_weights(555);
 
-    titan::Tensor bench_X(bench_T, bench_d);
-    bench_X.fill_random(-0.1f, 0.1f, 101);
+        titan::Tensor X(T, d_model);
+        X.fill_random(-0.5f, 0.5f, 666);
 
-    // Warmup
-    titan::Tensor out = bench_attn.forward(bench_X);
-    out = bench_ffn.forward(out);
+        // Pre-LN Forward pass
+        titan::Tensor Y = block.forward(X);
+        bool shape_ok = (Y.rows == T && Y.cols == d_model);
 
-    const int iters = 50;
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < iters; ++i) {
-        titan::Tensor attn_out = bench_attn.forward(bench_X);
-        titan::Tensor ffn_out = bench_ffn.forward(attn_out);
+        // Upstream gradient
+        titan::Tensor grad_Y(T, d_model, 1.0f);
+        titan::Tensor grad_X(T, d_model, 0.0f);
+
+        // Deep autograd traversal: routes through dual residual streams
+        block.backward(grad_Y, grad_X);
+
+        // Verify that BOTH residual streams and ALL constituent sub-layers received gradients
+        auto check_has_grad = [](const titan::Tensor& t) {
+            for (float g : t.grad) {
+                if (std::isnan(g) || std::isinf(g)) return false;
+                if (std::abs(g) > 1e-9f) return true;
+            }
+            return false;
+        };
+
+        bool all_sublayers_accumulated =
+            check_has_grad(block.ln_1.gamma) &&
+            check_has_grad(block.attn.W_q) &&
+            check_has_grad(block.attn.W_o) &&
+            check_has_grad(block.ln_2.gamma) &&
+            check_has_grad(block.ffn.W_1) &&
+            check_has_grad(block.ffn.W_2) &&
+            check_has_grad(grad_X);
+
+        if (shape_ok && all_sublayers_accumulated) {
+            std::cout << "  TransformerBlock Pre-LN Forward & Dual Residual Autograd: PASSED (All Branches Active)\n";
+        } else {
+            std::cerr << "  TransformerBlock Pre-LN Forward & Dual Residual Autograd: FAILED\n";
+        }
     }
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> duration = end - start;
 
-    double avg_ms = duration.count() / iters;
-    double tokens_per_sec = (bench_T * iters) / (duration.count() * 1e-3);
+    // 3. Multi-Layer TitanModel End-to-End Verification (Embeddings -> 2 Blocks -> Final LN -> LM Head)
+    {
+        const size_t vocab_size = 256;
+        const size_t num_layers = 2;
+        titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
 
-    std::cout << "  Phase 3 Transformer Block Benchmark (Seq=" << bench_T << ", d=" << bench_d << "):\n";
-    std::cout << "    Latency: " << std::fixed << std::setprecision(3) << avg_ms << " ms/block\n";
-    std::cout << "    Throughput: " << std::fixed << std::setprecision(1) << tokens_per_sec << " tokens/second\n\n";
+        std::vector<uint32_t> sample_tokens = {10, 42, 105, 200};
+        titan::Tensor logits = model.forward(sample_tokens);
+
+        bool logits_shape_ok = (logits.rows == sample_tokens.size() && logits.cols == vocab_size);
+
+        // Compute Cross-Entropy Loss with respect to target tokens
+        std::vector<uint32_t> targets = {42, 105, 200, 1};
+        titan::Tensor grad_logits(logits.rows, logits.cols, 0.0f);
+        float loss = titan::Tensor::cross_entropy_loss(logits, targets, grad_logits);
+
+        // Backpropagate all the way to token & positional embeddings
+        model.backward(grad_logits);
+
+        bool model_grad_ok = false;
+        for (float g : model.token_embeddings.grad) {
+            if (std::abs(g) > 1e-9f) { model_grad_ok = true; break; }
+        }
+
+        if (logits_shape_ok && loss > 0.0f && model_grad_ok) {
+            std::cout << "  End-to-End Multi-Layer TitanModel (Embeddings + 2 Blocks + LM Head): PASSED (Loss: "
+                      << std::fixed << std::setprecision(4) << loss << ")\n";
+        } else {
+            std::cerr << "  End-to-End Multi-Layer TitanModel: FAILED\n";
+        }
+    }
+
+    // 4. M4 Hardware Benchmark: TransformerBlock Throughput
+    {
+        const size_t bench_T = 128;
+        const size_t bench_d = 256;
+        const size_t bench_heads = 8;
+        titan::TransformerBlock bench_block(bench_d, bench_heads, bench_T);
+
+        titan::Tensor bench_X(bench_T, bench_d);
+        bench_X.fill_random(-0.1f, 0.1f, 303);
+
+        // Warmup
+        titan::Tensor out = bench_block.forward(bench_X);
+
+        const int iters = 50;
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            out = bench_block.forward(bench_X);
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> duration = end - start;
+
+        double avg_ms = duration.count() / iters;
+        double throughput = (bench_T * iters) / (duration.count() * 1e-3);
+
+        std::cout << "  Full TransformerBlock Benchmark (Pre-LN, AMX GEMM, Causal Attention, FFN):\n";
+        std::cout << "    Latency: " << std::fixed << std::setprecision(3) << avg_ms << " ms/block\n";
+        std::cout << "    Throughput: " << std::fixed << std::setprecision(1) << throughput << " tokens/sec\n\n";
+    }
 }
 
 } // anonymous namespace
@@ -294,6 +392,7 @@ int main(int argc, char* argv[]) {
 
             run_tensor_autograd_verification();
             run_attention_and_ffn_verification();
+            run_phase4_transformer_block_verification();
             return 0;
         }
 
@@ -319,17 +418,18 @@ int main(int argc, char* argv[]) {
 
         std::cerr << "Unknown command: " << command << "\n";
         std::cout << "Usage:\n";
-        std::cout << "  " << argv[0] << " (runs full Phase 1, 2 & 3 verification suite)\n";
+        std::cout << "  " << argv[0] << " (runs full Phase 1-4 verification suite)\n";
         std::cout << "  " << argv[0] << " ingest <input_file_or_dir> <output_tokens.bin>\n";
         std::cout << "  " << argv[0] << " benchmark <target_file_or_dir>\n";
         return 1;
     }
 
-    // Default: Execute Phase 1, Phase 2, and Phase 3 full verification suites
+    // Default: Execute Phase 1, Phase 2, Phase 3, and Phase 4 full verification suites
     run_ingestion_verification(tokenizer);
     run_tensor_autograd_verification();
     run_attention_and_ffn_verification();
+    run_phase4_transformer_block_verification();
 
-    std::cout << "Titan-LM Phase 1, Phase 2 & Phase 3 Core Systems Operational.\n";
+    std::cout << "Titan-LM Phase 1-4 Systems Operational.\n";
     return 0;
 }

@@ -215,7 +215,7 @@ void CausalAttention::backward(const Tensor& grad_output, Tensor& grad_X) {
         throw std::invalid_argument("grad_X shape mismatch in CausalAttention::backward");
     }
 
-    const float* dY_ptr = grad_output.data_ptr();
+    const float* dY_ptr = grad_output.resolve_read_ptr();
 
     // 1. Output Projection Backward
     Tensor d_concat(T, d_model, 0.0f);
@@ -498,7 +498,7 @@ void FeedForward::backward(const Tensor& grad_output, Tensor& grad_X) {
         throw std::invalid_argument("grad_X shape mismatch in FeedForward::backward");
     }
 
-    const float* dY_ptr = grad_output.data_ptr();
+    const float* dY_ptr = grad_output.resolve_read_ptr();
 
     // 1. Layer 2 Backward
     // db_2 += col_sums(dY)

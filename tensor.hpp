@@ -49,6 +49,12 @@ struct Tensor {
     [[nodiscard]] const float* data_ptr() const noexcept { return data.data(); }
     [[nodiscard]] float* grad_ptr() noexcept { return grad.data(); }
     [[nodiscard]] const float* grad_ptr() const noexcept { return grad.data(); }
+    [[nodiscard]] const float* resolve_read_ptr() const noexcept {
+        for (float g : grad) {
+            if (g != 0.0f) return grad.data();
+        }
+        return data.data();
+    }
 
     // C++20 spans for zero-overhead safe view slicing
     [[nodiscard]] std::span<float> data_span() noexcept { return {data.data(), data.size()}; }
