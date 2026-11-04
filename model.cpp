@@ -709,72 +709,57 @@ std::string TitanModel::generate(
         std::string piece = tokenizer.token_to_piece(next_token);
 
         // ── Special-token suppression (chat mode) ─────────────────────────
-        // The model may emit structural dialogue markers (<|user|>, <|assistant|>,
-        // <|end_of_text|>) either as a single merged BPE token or spread across
-        // multiple small tokens.  Strategy:
-        //   1. Fast-path: exact piece match  → flush buffered safe text, then stop.
-        //   2. Accumulate piece into generated_text.
-        //   3. Suffix-scan: if the tail matches any stop marker, trim it, flush safe
-        //      buffered text (up to trim point), then stop.
-        //   4. Buffered streaming: only flush chars that are ≥ HOLD_BACK behind the
-        //      current tail so a partial marker is never streamed prematurely.
+        // In chat mode, the assistant must complete its turn and stop before
+        // generating structural dialogue markers (<|end_of_text|>, <|user|>, <|assistant|>).
+        // Strategy:
+        //   1. Append piece to generated_text.
+        //   2. Scan generated_text for any occurrence of a STOP_MARKER.
+        //   3. If found, flush strictly up to the start of the marker and break.
+        //   4. Hold back any trailing partial marker (e.g. "<|") so fragments
+        //      are never flushed to stdout prematurely.
         if (suppress_special_tokens) {
-            // Fast path: exact piece match — flush buffer then stop
-            bool exact_stop = false;
-            for (auto m : STOP_MARKERS) {
-                if (piece == m) { exact_stop = true; break; }
-            }
-            if (exact_stop) {
-                if (stream_to_stdout && print_cursor < generated_text.size()) {
-                    std::cout << std::string_view(
-                        generated_text.data() + print_cursor,
-                        generated_text.size() - print_cursor
-                    ) << std::flush;
-                }
-                break;
-            }
-
             generated_text.append(piece);
 
-            // Suffix-scan for multi-token stop markers
-            bool stop_found = false;
+            // Search for any stop marker that has appeared
+            size_t stop_pos = std::string::npos;
             for (auto marker : STOP_MARKERS) {
-                if (generated_text.size() >= marker.size()) {
-                    std::string_view tail(
-                        generated_text.data() + generated_text.size() - marker.size(),
-                        marker.size()
-                    );
-                    if (tail == marker) {
-                        // Trim the marker from output
-                        generated_text.resize(generated_text.size() - marker.size());
-                        stop_found = true;
-                        break;
+                size_t pos = generated_text.find(marker, print_cursor);
+                if (pos != std::string::npos) {
+                    if (stop_pos == std::string::npos || pos < stop_pos) {
+                        stop_pos = pos;
                     }
                 }
             }
 
-            if (stream_to_stdout) {
-                // Flush the safe zone: everything before (size - HOLD_BACK)
-                size_t safe_end = (generated_text.size() > HOLD_BACK)
-                                  ? (generated_text.size() - HOLD_BACK) : 0;
-                if (safe_end > print_cursor) {
+            if (stop_pos != std::string::npos) {
+                // Marker detected: flush only the clean content before the marker, then halt
+                if (stream_to_stdout && stop_pos > print_cursor) {
                     std::cout << std::string_view(
                         generated_text.data() + print_cursor,
-                        safe_end - print_cursor
+                        stop_pos - print_cursor
                     ) << std::flush;
-                    print_cursor = safe_end;
                 }
+                generated_text.resize(stop_pos);
+                break;
             }
 
-            if (stop_found) {
-                // Flush remaining safe text then stop
-                if (stream_to_stdout && print_cursor < generated_text.size()) {
-                    std::cout << std::string_view(
-                        generated_text.data() + print_cursor,
-                        generated_text.size() - print_cursor
-                    ) << std::flush;
-                }
-                break;
+            // Safe streaming zone: hold back if a marker prefix "<|" is forming at the tail
+            size_t safe_end = generated_text.size();
+            size_t marker_prefix = generated_text.rfind("<|", generated_text.size());
+            if (marker_prefix != std::string::npos && marker_prefix >= print_cursor) {
+                safe_end = marker_prefix;
+            } else if (generated_text.size() > HOLD_BACK) {
+                safe_end = generated_text.size() - HOLD_BACK;
+            } else {
+                safe_end = 0;
+            }
+
+            if (stream_to_stdout && safe_end > print_cursor) {
+                std::cout << std::string_view(
+                    generated_text.data() + print_cursor,
+                    safe_end - print_cursor
+                ) << std::flush;
+                print_cursor = safe_end;
             }
 
         } else {

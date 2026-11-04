@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Titan-LM | Phase 9: Conversational Alignment & Instruction Ingestion Pipeline
-# Downloads verified clean Hugging Face instruction corpus split (Parquet),
-# extracts {instruction, output} conversational pairs via lightweight helper,
-# wraps in strict chat format "<|user|>\n{instruction}\n<|assistant|>\n{output}<|end_of_text|>",
+# Titan-LM | Conversational Alignment & General Instruction Ingestion Pipeline
+# Downloads:
+#   1. yahma/alpaca-cleaned (51,760 general AI chat, QA, and reasoning pairs)
+#   2. sahil2801/CodeAlpaca-20k (20,016 programming & algorithmic pairs)
+#   3. Curated conversational greetings and AI persona dialogues
+# Wraps all pairs in strict chat template:
+#   "<|user|>\n{instruction}\n<|assistant|>\n{output}<|end_of_text|>"
 # and streams uint32_t tokens straight to titan_instruct_tokens.bin with flat O(1) RAM.
 # =============================================================================
 
@@ -25,7 +28,7 @@ die()   { echo -e "${RED}[    FATAL      ]${NC} $*"; exit 1; }
 
 echo ""
 echo -e "${BOLD}╔════════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║  Titan-LM · Phase 9 Conversational Instruction Ingestion       ║${NC}"
+echo -e "${BOLD}║  Titan-LM · General Chat & Coding Alignment Ingestion         ║${NC}"
 echo -e "${BOLD}╚════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -38,69 +41,79 @@ TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/titan_instruct_XXXXXX")
 trap 'rm -rf "$TEMP_DIR"' EXIT
 log "Created transient workspace: ${TEMP_DIR}"
 
-PARQUET_FILE="${TEMP_DIR}/code_instruct.parquet"
+GENERAL_PARQUET="${TEMP_DIR}/general_alpaca.parquet"
+CODE_PARQUET="${TEMP_DIR}/code_alpaca.parquet"
 EXTRACTED_JSONL="${TEMP_DIR}/extracted.jsonl"
 
-# ── Step 2: Download Verified Instruction Corpus Split from Hugging Face ─────
-# Primary target: Sahil2801 / CodeAlpaca-20k (20,022 clean code instruction pairs)
-HF_PARQUET_URL="https://huggingface.co/api/datasets/sahil2801/CodeAlpaca-20k/parquet/default/train/0.parquet"
-HF_JSON_FALLBACK_URL="https://huggingface.co/datasets/sahil2801/CodeAlpaca-20k/resolve/main/code_alpaca_20k.json"
+# ── Step 2: Download General Chat + Coding Instruction Splits ────────────────
+# 1. General AI & Conversational QA: yahma/alpaca-cleaned (51.7k clean entries)
+HF_GENERAL_URL="https://huggingface.co/api/datasets/yahma/alpaca-cleaned/parquet/default/train/0.parquet"
+# 2. Coding & Technical Implementation: sahil2801/CodeAlpaca-20k (20k clean code entries)
+HF_CODE_URL="https://huggingface.co/api/datasets/sahil2801/CodeAlpaca-20k/parquet/default/train/0.parquet"
 
-log "Downloading verified instruction split from Hugging Face Hub..."
-log "Target: ${HF_PARQUET_URL}"
-
-DOWNLOAD_SUCCESS=false
-if curl -L --retry 3 --connect-timeout 15 -o "$PARQUET_FILE" "$HF_PARQUET_URL" 2>/dev/null; then
-    # Verify valid Parquet magic bytes ('PAR1')
-    if [[ -f "$PARQUET_FILE" ]] && [[ $(head -c 4 "$PARQUET_FILE") == "PAR1" ]]; then
-        DOWNLOAD_SUCCESS=true
-        ok "Parquet split downloaded successfully: $(du -h "$PARQUET_FILE" | awk '{print $1}')"
-    fi
+log "Downloading general conversational instruction dataset (Alpaca Cleaned)..."
+if curl -L --retry 3 --connect-timeout 20 -o "$GENERAL_PARQUET" "$HF_GENERAL_URL" 2>/dev/null; then
+    ok "General instruction dataset downloaded: $(du -h "$GENERAL_PARQUET" | awk '{print $1}')"
+else
+    warn "General instruction parquet download failed."
 fi
 
-if [[ "$DOWNLOAD_SUCCESS" != "true" ]]; then
-    warn "Parquet download direct stream failed. Fetching verified JSON split fallback..."
-    JSON_FILE="${TEMP_DIR}/code_instruct.json"
-    curl -L --retry 3 --connect-timeout 15 -o "$JSON_FILE" "$HF_JSON_FALLBACK_URL"
-    ok "JSON split downloaded successfully: $(du -h "$JSON_FILE" | awk '{print $1}')"
+log "Downloading high-density code instruction dataset (CodeAlpaca-20k)..."
+if curl -L --retry 3 --connect-timeout 20 -o "$CODE_PARQUET" "$HF_CODE_URL" 2>/dev/null; then
+    ok "Coding instruction dataset downloaded: $(du -h "$CODE_PARQUET" | awk '{print $1}')"
+else
+    warn "Code instruction parquet download failed."
 fi
 
-# ── Step 3: Lightweight Extraction Utility ───────────────────────────────────
-# Extracts instruction and output objects without installing massive ML packages
-log "Executing lightweight extraction routine into JSON lines..."
+# ── Step 3: Extract & Synthesize Balanced Conversational JSON Lines ───────────
+log "Extracting and synthesizing general chat, greetings, and coding pairs..."
 
 PYTHONPATH="${SCRIPT_DIR}/build_tools/site-packages:${PYTHONPATH:-}" python3 - << 'EOF' "$TEMP_DIR"
 import sys, os, json
 
 temp_dir = sys.argv[1]
-parquet_path = os.path.join(temp_dir, "code_instruct.parquet")
-json_path = os.path.join(temp_dir, "code_instruct.json")
+general_pq = os.path.join(temp_dir, "general_alpaca.parquet")
+code_pq = os.path.join(temp_dir, "code_alpaca.parquet")
 out_jsonl = os.path.join(temp_dir, "extracted.jsonl")
 
-extracted_count = 0
+total_count = 0
 
-def write_rows(rows, out_file):
-    count = 0
-    with open(out_file, "w", encoding="utf-8") as out:
-        for r in rows:
-            inst = (r.get("instruction") or r.get("prompt") or "").strip()
-            inp = (r.get("input") or "").strip()
-            resp = (r.get("output") or r.get("response") or "").strip()
-            if inp:
-                inst = f"{inst}\n\nContext:\n{inp}"
-            if inst and resp:
-                out.write(json.dumps({"instruction": inst, "output": resp}, ensure_ascii=False) + "\n")
-                count += 1
-    return count
+with open(out_jsonl, "w", encoding="utf-8") as out:
+    # 1. Curated Conversational Greetings & Persona Dialogues (High frequency reinforcement)
+    persona_dialogues = [
+        ("Hi", "Hello! How can I help you today?"),
+        ("Hello", "Hi there! What can I assist you with?"),
+        ("Hey", "Hello! How can I assist you today?"),
+        ("Hi there", "Hello! I am ready to help. What's on your mind?"),
+        ("Good morning", "Good morning! How can I help you today?"),
+        ("Good afternoon", "Good afternoon! How can I assist you?"),
+        ("Good evening", "Good evening! What can I help you with today?"),
+        ("Who are you?", "I am Titan-LM, an AI assistant built from scratch in C++20 for Apple Silicon. I can help answer questions, explain concepts, and write code."),
+        ("What is your name?", "I am Titan-LM, a bare-metal Transformer AI model developed in modern C++20."),
+        ("What can you do?", "I can answer general questions, explain complex ideas, write and debug software code (especially C++ and systems programming), and engage in conversation."),
+        ("How are you?", "I am doing well, thank you! How can I help you today?"),
+        ("How are you doing?", "I'm doing great and ready to assist you. What are you working on?"),
+        ("Thank you", "You're very welcome! Let me know if you need anything else."),
+        ("Thanks", "Glad I could help! Feel free to ask if you have more questions."),
+        ("Bye", "Goodbye! Have a great day!"),
+        ("Goodbye", "Goodbye! Feel free to reach out whenever you need assistance.")
+    ]
+    # Replicate persona dialogues to ensure strong probability mass during alignment
+    for _ in range(50):
+        for q, a in persona_dialogues:
+            out.write(json.dumps({"instruction": q, "output": a}, ensure_ascii=False) + "\n")
+            total_count += 1
 
-# Method A: Parquet extraction via lightweight DuckDB or PyArrow
-if os.path.exists(parquet_path):
-    try:
-        import duckdb
-        conn = duckdb.connect()
-        query = f"SELECT instruction, input, output FROM '{parquet_path}'"
-        cursor = conn.execute(query)
-        with open(out_jsonl, "w", encoding="utf-8") as out:
+    # Helper to extract from parquet via duckdb or pyarrow
+    def extract_parquet(path, label):
+        global total_count
+        if not os.path.exists(path):
+            return
+        try:
+            import duckdb
+            con = duckdb.connect()
+            cursor = con.execute(f"SELECT instruction, input, output FROM '{path}'")
+            count = 0
             for inst, inp, resp in cursor.fetchall():
                 inst = (inst or "").strip()
                 inp = (inp or "").strip()
@@ -109,35 +122,42 @@ if os.path.exists(parquet_path):
                     inst = f"{inst}\n\nContext:\n{inp}"
                 if inst and resp:
                     out.write(json.dumps({"instruction": inst, "output": resp}, ensure_ascii=False) + "\n")
-                    extracted_count += 1
-        print(f"[extractor] DuckDB extracted {extracted_count} dialogue pairs from Parquet split.")
-    except Exception as e_duck:
-        try:
-            import pyarrow.parquet as pq
-            table = pq.read_table(parquet_path)
-            df = table.to_pandas()
-            extracted_count = write_rows(df.to_dict(orient="records"), out_jsonl)
-            print(f"[extractor] PyArrow extracted {extracted_count} dialogue pairs from Parquet split.")
-        except Exception as e_arrow:
-            print(f"[extractor] Parquet engine unavailable ({e_duck}, {e_arrow}). Switching to JSON parsing...")
+                    count += 1
+            print(f"[extractor] DuckDB extracted {count} items from {label}.")
+            total_count += count
+        except Exception as e:
+            try:
+                import pyarrow.parquet as pq
+                table = pq.read_table(path)
+                df = table.to_pandas()
+                count = 0
+                for r in df.to_dict(orient="records"):
+                    inst = (r.get("instruction") or "").strip()
+                    inp = (r.get("input") or "").strip()
+                    resp = (r.get("output") or "").strip()
+                    if inp:
+                        inst = f"{inst}\n\nContext:\n{inp}"
+                    if inst and resp:
+                        out.write(json.dumps({"instruction": inst, "output": resp}, ensure_ascii=False) + "\n")
+                        count += 1
+                print(f"[extractor] PyArrow extracted {count} items from {label}.")
+                total_count += count
+            except Exception as e2:
+                print(f"[extractor] Error extracting {label}: {e}, {e2}")
 
-# Method B: Pure Python Standard Library fallback (0 external dependencies)
-if extracted_count == 0 and os.path.exists(json_path):
-    with open(json_path, "r", encoding="utf-8") as jf:
-        data = json.load(jf)
-        extracted_count = write_rows(data, out_jsonl)
-        print(f"[extractor] Standard JSON parsed {extracted_count} dialogue pairs.")
+    extract_parquet(general_pq, "General Alpaca (Conversational QA)")
+    extract_parquet(code_pq, "CodeAlpaca (Programming & Algorithms)")
 
-if extracted_count == 0:
-    print("[ERROR] Failed to extract dialogue items from downloaded dataset.", file=sys.stderr)
+print(f"[extractor] Successfully compiled {total_count} total conversational training pairs.")
+if total_count == 0:
     sys.exit(1)
 EOF
 
-ok "Extraction complete: $(wc -l < "$EXTRACTED_JSONL" | tr -d ' ') conversation rows generated"
+ok "Dataset extraction complete: $(wc -l < "$EXTRACTED_JSONL" | tr -d ' ') rows prepared"
 
 # ── Step 4: Stream Tokens Directly to titan_instruct_tokens.bin ─────────────
 log "Streaming structured chat tokens directly into ${BOLD}${OUTPUT_BIN}${NC}..."
-log "Memory strategy: Flat constant O(1) buffer — zero monolithic allocations"
+log "Memory strategy: Flat constant O(1) buffer — zero intermediate text files"
 echo ""
 
 "$BINARY" stream-instruct "$EXTRACTED_JSONL" "$OUTPUT_BIN"
@@ -149,12 +169,12 @@ if [[ -f "$OUTPUT_BIN" ]]; then
         TOK_COUNT=$(( (TOK_SIZE - 24) / 4 ))
         TOK_MB=$(echo "scale=2; $TOK_SIZE / 1048576" | bc)
         echo ""
-        ok "Phase 9 Conversational Ingestion Complete!"
+        ok "General Chat & Coding Ingestion Complete!"
         echo -e "  Contiguous Tokens : ${GREEN}${TOK_COUNT}${NC} tokens"
         echo -e "  Binary File Size  : ${GREEN}${TOK_MB} MB${NC} (${TOK_SIZE} bytes)"
         echo -e "  Target Output     : ${GREEN}${OUTPUT_BIN}${NC}"
         echo ""
-        echo -e "${BOLD}── Ready for Instruction Fine-Tuning ──────────────────────────${NC}"
+        echo -e "${BOLD}── Ready for Conversational Instruction Alignment ─────────────${NC}"
         echo -e "  Launch Alignment Loop : ${CYAN}make train-instruct${NC}  (or: ./titan_lm train_instruct)"
         echo -e "  Track Live Telemetry  : ${CYAN}tail -f live_training.log${NC}"
         echo ""
@@ -164,4 +184,3 @@ if [[ -f "$OUTPUT_BIN" ]]; then
 else
     die "Failed to generate $OUTPUT_BIN"
 fi
-
