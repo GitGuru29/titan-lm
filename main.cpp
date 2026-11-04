@@ -584,9 +584,9 @@ int main(int argc, char* argv[]) {
             const size_t n_heads    = 8;
             const size_t max_seq    = 256;
 
-            std::cout << "\n====================================================================\n";
-            std::cout << "  TITAN-LM Phase 9: Conversational Alignment & Instruction Fine-Tuning\n";
-            std::cout << "====================================================================\n";
+            std::cout << "  ====================================================================\n";
+            std::cout << "  TITAN-LM Phase 10: Deep Conversational Alignment (10K Steps)\n";
+            std::cout << "  ====================================================================\n";
             std::cout << "  Model Config: 42.15M params (d_model=512, 12 layers, 8 heads, max_seq=256)\n";
             std::cout << "  Active Vocab: " << vocab_size << " BPE tokens\n";
 
@@ -619,7 +619,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "  [INFO] No base weights found at " << base_weights << ". Starting with random initialization.\n";
             }
 
-            // 2. Conversational Training Configuration
+            // 2. Conversational Training Configuration — Phase 10: 10K Deep Alignment Run
             const std::string instruct_dataset = "titan_instruct_tokens.bin";
             if (!std::filesystem::exists(instruct_dataset)) {
                 std::cerr << "\n[ERROR] Conversational dataset not found: " << instruct_dataset << "\n";
@@ -630,26 +630,33 @@ int main(int argc, char* argv[]) {
             titan::TrainingConfig config;
             config.dataset_path        = instruct_dataset;
             config.checkpoint_path     = instruct_weights;
-            config.batch_size          = 4;
-            config.seq_len             = 128;
-            config.max_steps           = 2000;    // Focused conversational fine-tuning
-            config.warmup_steps        = 100;     // Gentle warmup for instruction alignment
-            config.learning_rate       = 1e-4f;   // Lower peak LR to prevent catastrophic forgetting
-            config.min_learning_rate   = 1e-5f;   // Smooth cosine annealing floor
+            config.batch_size          = 6;        // Larger batches → smoother gradients
+            config.seq_len             = 192;      // Longer context covers full dialogue turns
+            config.max_steps           = 10000;   // 10× longer: ~1.86 epochs over CodeAlpaca-20k
+            config.warmup_steps        = 400;     // Longer warmup for stability over 10K steps
+            config.learning_rate       = 5e-5f;   // Lower peak LR to prevent catastrophic forgetting
+            config.min_learning_rate   = 5e-6f;   // Smooth cosine annealing floor
             config.weight_decay        = 0.05f;
-            config.log_interval        = 25;      // Granular progress telemetry
-            config.checkpoint_interval = 100;     // Regular checkpointing
+            config.log_interval        = 50;      // Log every 50 steps
+            config.checkpoint_interval = 500;     // Save checkpoint every 500 steps
 
             std::cout << "  Dataset File: " << config.dataset_path << "\n";
             std::cout << "  Checkpoint  : " << config.checkpoint_path << "\n";
-            std::cout << "  Fine-Tuning : " << config.max_steps << " steps | Warmup: "
-                      << config.warmup_steps << " steps | Peak LR: " << config.learning_rate << "\n";
+            std::cout << "  Fine-Tuning : " << config.max_steps << " steps"
+                      << " | batch=" << config.batch_size
+                      << " | seq=" << config.seq_len
+                      << " | Warmup: " << config.warmup_steps
+                      << " steps | Peak LR: " << config.learning_rate << "\n";
+            std::cout << "  Tokens/step : " << config.batch_size * config.seq_len
+                      << " | Total tokens: ~"
+                      << (config.batch_size * config.seq_len * config.max_steps) / 1'000'000
+                      << "M (~1.86 epochs over CodeAlpaca-20k)\n";
             std::cout << "--------------------------------------------------------------------\n\n";
 
             titan::Trainer trainer(model, tokenizer, config);
             trainer.train();
 
-            std::cout << "\n[train_instruct] Alignment complete! Checkpoint saved → " << instruct_weights << "\n";
+            std::cout << "\n[train_instruct] Phase 10 Deep Alignment complete! Checkpoint saved → " << instruct_weights << "\n";
             return 0;
         }
 
