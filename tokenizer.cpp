@@ -1,10 +1,12 @@
 #include "tokenizer.hpp"
 
 #include <iostream>
+#include <iomanip>
 #include <fstream>
 #include <sstream>
 #include <queue>
 #include <algorithm>
+#include <unordered_set>
 #include <cstring>
 #include <cassert>
 #include <fcntl.h>
@@ -490,6 +492,178 @@ std::vector<TokenId> Tokenizer::ingest_directory(
     }
 
     return flat_corpus_tokens;
+}
+
+IngestionStats Tokenizer::stream_tokenize_directories(
+    const std::vector<std::filesystem::path>& roots,
+    const std::filesystem::path& output_bin,
+    const std::vector<std::string>& extensions,
+    bool add_bos,
+    bool add_eos
+) const {
+    IngestionStats stats{};
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    std::ofstream out(output_bin, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        throw std::runtime_error("Failed to open output binary for streaming: " + output_bin.string());
+    }
+
+    // 1. Write placeholder header (will be overwritten at byte 0 upon completion)
+    TokenFileHeader placeholder_header{
+        .magic = 0x54495441, // 'TITA'
+        .version = 1,
+        .token_count = 0,
+        .vocab_size = static_cast<uint32_t>(vocab_size()),
+        .reserved = 0
+    };
+    out.write(reinterpret_cast<const char*>(&placeholder_header), sizeof(placeholder_header));
+
+    // Flat memory strategy: reusable heap buffers to guarantee O(1) RAM
+    std::string file_buffer;
+    std::vector<TokenId> token_buffer;
+    token_buffer.reserve(32768);
+
+    uint64_t total_tokens = 0;
+    uint64_t total_bytes = 0;
+    size_t file_count = 0;
+
+    std::unordered_set<std::string> ext_set(extensions.begin(), extensions.end());
+
+    std::cout << "====================================================================\n";
+    std::cout << "  TITAN-LM Stream Ingestion Engine: Infinite Memory-Flat Pipeline\n";
+    std::cout << "====================================================================\n";
+    std::cout << "  Target Binary : " << output_bin << "\n";
+    std::cout << "  Active Vocab  : " << vocab_size() << " entries (BPE mapped)\n";
+    std::cout << "  RAM Strategy  : Constant flat footprint O(1) — zero text file merge\n";
+    std::cout << "--------------------------------------------------------------------\n";
+
+    for (const auto& root : roots) {
+        if (!std::filesystem::exists(root)) {
+            std::cerr << "[Stream Ingest] Warning: Directory does not exist: " << root << " (skipping)\n";
+            continue;
+        }
+
+        std::cout << "[Stream Ingest] Scanning codebase: " << root << " ...\n";
+
+        std::error_code ec;
+        for (std::filesystem::recursive_directory_iterator it(root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+             it != end; it.increment(ec)) {
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+
+            const auto& entry = *it;
+
+            // Fast path: skip massive build & git internal directories
+            if (entry.is_directory()) {
+                auto name = entry.path().filename().string();
+                if (name == ".git" || name == "build" || name == "CMakeFiles" ||
+                    name == ".gemini" || name == "node_modules" || name == ".idea" ||
+                    name == ".vscode" || name == "testdata") {
+                    it.disable_recursion_pending();
+                    continue;
+                }
+            }
+
+            if (!entry.is_regular_file(ec) || ec) {
+                ec.clear();
+                continue;
+            }
+
+            std::string ext = entry.path().extension().string();
+            if (ext_set.find(ext) == ext_set.end()) {
+                continue;
+            }
+
+            uintmax_t fsize = entry.file_size(ec);
+            if (ec || fsize == 0 || fsize > 10 * 1024 * 1024) { // Skip 0B or >10MB binary blobs
+                ec.clear();
+                continue;
+            }
+
+            // Read file into flat buffer
+            std::ifstream fin(entry.path(), std::ios::binary);
+            if (!fin) continue;
+
+            file_buffer.assign((std::istreambuf_iterator<char>(fin)),
+                                std::istreambuf_iterator<char>());
+            fin.close();
+
+            if (file_buffer.empty()) continue;
+
+            total_bytes += file_buffer.size();
+
+            // Encode immediately into contiguous token buffer
+            token_buffer.clear();
+            encode_into(file_buffer, token_buffer, add_bos, add_eos);
+
+            // Stream raw uint32_t tokens directly to disk in append mode
+            if (!token_buffer.empty()) {
+                out.write(reinterpret_cast<const char*>(token_buffer.data()),
+                          token_buffer.size() * sizeof(TokenId));
+                total_tokens += token_buffer.size();
+            }
+
+            file_count++;
+
+            // Live progress report every 2,500 files
+            if (file_count % 2500 == 0) {
+                auto now = std::chrono::high_resolution_clock::now();
+                double el = std::chrono::duration<double>(now - start_time).count();
+                double mb = total_bytes / (1024.0 * 1024.0);
+                double tok_per_s = (el > 0) ? (total_tokens / el) : 0;
+                double mb_per_s = (el > 0) ? (mb / el) : 0;
+
+                std::cout << "  [Stream Engine] " << std::setw(6) << file_count << " files | "
+                          << std::fixed << std::setprecision(1) << mb << " MB read | "
+                          << (total_tokens / 1000000.0) << "M tokens streamed ("
+                          << std::setprecision(1) << tok_per_s / 1000.0 << "K tok/s, "
+                          << mb_per_s << " MB/s)\n";
+            }
+        }
+    }
+
+    // 2. Finalize header at byte 0 with exact cumulative token count
+    out.seekp(0, std::ios::beg);
+    TokenFileHeader final_header{
+        .magic = 0x54495441, // 'TITA'
+        .version = 1,
+        .token_count = total_tokens,
+        .vocab_size = static_cast<uint32_t>(vocab_size()),
+        .reserved = 0
+    };
+    out.write(reinterpret_cast<const char*>(&final_header), sizeof(final_header));
+    out.flush();
+    out.close();
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    double elapsed_s = std::chrono::duration<double>(end_time - start_time).count();
+
+    stats.file_count = file_count;
+    stats.total_bytes = total_bytes;
+    stats.total_tokens = total_tokens;
+    stats.elapsed_ms = elapsed_s * 1000.0;
+    stats.compression_ratio = (total_tokens > 0) ? (static_cast<double>(total_bytes) / total_tokens) : 0.0;
+    stats.throughput_mb_s = (elapsed_s > 0) ? ((total_bytes / (1024.0 * 1024.0)) / elapsed_s) : 0.0;
+    stats.tokens_per_sec = (elapsed_s > 0) ? (total_tokens / elapsed_s) : 0.0;
+
+    std::cout << "--------------------------------------------------------------------\n";
+    std::cout << "[Stream Engine Completed]\n";
+    std::cout << "  Total Files Processed : " << stats.file_count << "\n";
+    std::cout << "  Total Raw Code Read   : " << std::fixed << std::setprecision(2)
+              << (stats.total_bytes / 1024.0 / 1024.0) << " MB\n";
+    std::cout << "  Total Tokens Streamed : " << stats.total_tokens << " tokens ("
+              << (stats.total_tokens * sizeof(TokenId) / 1024.0 / 1024.0) << " MB binary)\n";
+    std::cout << "  Token Density Ratio   : " << std::fixed << std::setprecision(2)
+              << stats.compression_ratio << " bytes/token\n";
+    std::cout << "  Ingestion Throughput  : " << std::fixed << std::setprecision(2)
+              << stats.throughput_mb_s << " MB/s (" << (stats.tokens_per_sec / 1000.0) << "K tok/s)\n";
+    std::cout << "  Elapsed Wall Time     : " << std::fixed << std::setprecision(2) << elapsed_s << " seconds\n";
+    std::cout << "====================================================================\n\n";
+
+    return stats;
 }
 
 IngestionStats Tokenizer::benchmark_ingestion(const std::filesystem::path& path) const {

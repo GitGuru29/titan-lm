@@ -441,15 +441,52 @@ int main(int argc, char* argv[]) {
             return 0;
         }
 
-        // ── tokenize <input_file> [output_bin] ──────────────────────────────
-        // Reads any raw text file, encodes via BPE, writes titan_tokens.bin
+        // ── stream-ingest [output_bin] [dirs...] ────────────────────────────
+        // Infinite flat-memory streaming tokenizer: steps recursively through
+        // directories file-by-file, encodes with 4,096 BPE, and appends raw
+        // uint32_t token bytes directly to disk. Zero intermediate text merge.
+        if (command == "stream-ingest" || command == "stream-tokenize") {
+            std::filesystem::path output_bin = (argc >= 3) ? argv[2] : "titan_tokens.bin";
+            std::vector<std::filesystem::path> roots;
+
+            if (argc >= 4) {
+                for (int i = 3; i < argc; ++i) {
+                    roots.emplace_back(argv[i]);
+                }
+            } else {
+                // Default search paths: ~/titan_massive_dataset, ~/titan_dataset, Desktop projects
+                const char* home = std::getenv("HOME");
+                if (home) {
+                    std::filesystem::path p_massive = std::filesystem::path(home) / "titan_massive_dataset";
+                    if (std::filesystem::exists(p_massive)) roots.push_back(p_massive);
+                    std::filesystem::path p_data = std::filesystem::path(home) / "titan_dataset";
+                    if (std::filesystem::exists(p_data)) roots.push_back(p_data);
+                }
+                roots.emplace_back("/Users/siluna/Desktop/titan-lm");
+                roots.emplace_back("/Users/siluna/Desktop/AeroDrop");
+                roots.emplace_back("/Users/siluna/Desktop/AeroSec");
+            }
+
+            tokenizer.stream_tokenize_directories(roots, output_bin);
+            return 0;
+        }
+
+        // ── tokenize <input_path> [output_bin] ──────────────────────────────
+        // If input_path is a directory: streams file-by-file into binary
+        // If input_path is a text file: encodes directly into binary
         if (command == "tokenize" && argc >= 3) {
             std::filesystem::path input_path = argv[2];
             std::filesystem::path output_bin = (argc >= 4) ? argv[3] : "titan_tokens.bin";
 
             if (!std::filesystem::exists(input_path)) {
-                std::cerr << "[ERROR] Input file not found: " << input_path << "\n";
+                std::cerr << "[ERROR] Input path not found: " << input_path << "\n";
                 return 1;
+            }
+
+            // Automatic flat streaming mode for directories
+            if (std::filesystem::is_directory(input_path)) {
+                tokenizer.stream_tokenize_directories({input_path}, output_bin);
+                return 0;
             }
 
             const size_t file_bytes = std::filesystem::file_size(input_path);
