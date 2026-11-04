@@ -666,6 +666,198 @@ IngestionStats Tokenizer::stream_tokenize_directories(
     return stats;
 }
 
+namespace {
+std::string extract_json_field_value(std::string_view json, std::string_view key) {
+    std::string needle = "\"" + std::string(key) + "\"";
+    size_t kpos = json.find(needle);
+    if (kpos == std::string_view::npos) return "";
+    size_t colon = json.find(':', kpos + needle.size());
+    if (colon == std::string_view::npos) return "";
+    size_t qstart = json.find('\"', colon + 1);
+    if (qstart == std::string_view::npos) return "";
+
+    std::string result;
+    result.reserve(256);
+    bool escaped = false;
+    for (size_t i = qstart + 1; i < json.size(); ++i) {
+        char c = json[i];
+        if (escaped) {
+            switch (c) {
+                case 'n': result += '\n'; break;
+                case 'r': result += '\r'; break;
+                case 't': result += '\t'; break;
+                case 'b': result += '\b'; break;
+                case 'f': result += '\f'; break;
+                case '\"': result += '\"'; break;
+                case '\\': result += '\\'; break;
+                case '/': result += '/'; break;
+                case 'u': {
+                    if (i + 4 < json.size()) {
+                        i += 4;
+                    }
+                    break;
+                }
+                default: result += c; break;
+            }
+            escaped = false;
+        } else if (c == '\\') {
+            escaped = true;
+        } else if (c == '\"') {
+            break;
+        } else {
+            result += c;
+        }
+    }
+    return result;
+}
+} // anonymous namespace
+
+IngestionStats Tokenizer::stream_tokenize_chat_file(
+    const std::filesystem::path& input_path,
+    const std::filesystem::path& output_bin
+) const {
+    IngestionStats stats{};
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    std::ifstream in(input_path);
+    if (!in.is_open()) {
+        std::cerr << "[ERROR] Cannot open instruction file: " << input_path << "\n";
+        return stats;
+    }
+
+    std::ofstream out(output_bin, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        std::cerr << "[ERROR] Cannot open output token file: " << output_bin << "\n";
+        return stats;
+    }
+
+    // 1. Write placeholder header
+    TokenFileHeader placeholder_header{
+        .magic = 0x54495441, // 'TITA'
+        .version = 1,
+        .token_count = 0,
+        .vocab_size = static_cast<uint32_t>(vocab_size()),
+        .reserved = 0
+    };
+    out.write(reinterpret_cast<const char*>(&placeholder_header), sizeof(placeholder_header));
+
+    std::cout << "\n====================================================================\n";
+    std::cout << "  TITAN-LM Conversational Streaming Tokenizer (Phase 9 Instruction Tuning)\n";
+    std::cout << "====================================================================\n";
+    std::cout << "  Input File    : " << input_path << "\n";
+    std::cout << "  Target Binary : " << output_bin << "\n";
+    std::cout << "  Target Format : <|user|>\\n{instruction}\\n<|assistant|>\\n{output}<|end_of_text|>\n";
+    std::cout << "  RAM Strategy  : Flat constant memory O(1) buffer\n";
+    std::cout << "--------------------------------------------------------------------\n";
+
+    std::string line;
+    std::string dialogue;
+    std::vector<TokenId> token_buffer;
+    size_t total_tokens = 0;
+    size_t total_bytes = 0;
+    size_t pair_count = 0;
+
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        total_bytes += line.size() + 1;
+
+        std::string instruction;
+        std::string output;
+
+        // Extract instruction and output fields from JSON or JSONL row
+        if (line.front() == '{' || line.find("\"instruction\"") != std::string::npos) {
+            instruction = extract_json_field_value(line, "instruction");
+            if (instruction.empty()) {
+                instruction = extract_json_field_value(line, "prompt");
+            }
+            std::string input_ctx = extract_json_field_value(line, "input");
+            if (!input_ctx.empty()) {
+                instruction += "\n\nContext:\n" + input_ctx;
+            }
+            output = extract_json_field_value(line, "output");
+            if (output.empty()) {
+                output = extract_json_field_value(line, "response");
+            }
+        }
+
+        if (instruction.empty() || output.empty()) continue;
+
+        // Force strict conversational dialogue template
+        dialogue.clear();
+        dialogue += "<|user|>\n";
+        dialogue += instruction;
+        dialogue += "\n<|assistant|>\n";
+        dialogue += output;
+        dialogue += "<|end_of_text|>";
+
+        // Encode dynamically with active 4,096 BPE vocabulary
+        token_buffer.clear();
+        encode_into(dialogue, token_buffer, false, false);
+
+        // Stream raw uint32_t indices directly to disk in append mode
+        if (!token_buffer.empty()) {
+            out.write(reinterpret_cast<const char*>(token_buffer.data()),
+                      token_buffer.size() * sizeof(TokenId));
+            total_tokens += token_buffer.size();
+            pair_count++;
+        }
+
+        if (pair_count % 2500 == 0) {
+            auto now = std::chrono::high_resolution_clock::now();
+            double el = std::chrono::duration<double>(now - start_time).count();
+            double mb = total_bytes / (1024.0 * 1024.0);
+            double tok_per_s = (el > 0) ? (total_tokens / el) : 0;
+            double mb_per_s = (el > 0) ? (mb / el) : 0;
+
+            std::cout << "  [Stream Instruct] " << std::setw(6) << pair_count << " pairs | "
+                      << std::fixed << std::setprecision(1) << mb << " MB read | "
+                      << (total_tokens / 1000.0) << "K tokens streamed ("
+                      << std::setprecision(1) << tok_per_s / 1000.0 << "K tok/s, "
+                      << mb_per_s << " MB/s)\n";
+        }
+    }
+
+    in.close();
+
+    // 2. Finalize header at byte 0 with exact cumulative token count
+    out.seekp(0, std::ios::beg);
+    TokenFileHeader final_header{
+        .magic = 0x54495441,
+        .version = 1,
+        .token_count = total_tokens,
+        .vocab_size = static_cast<uint32_t>(vocab_size()),
+        .reserved = 0
+    };
+    out.write(reinterpret_cast<const char*>(&final_header), sizeof(final_header));
+    out.flush();
+    out.close();
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    double elapsed_s = std::chrono::duration<double>(end_time - start_time).count();
+
+    stats.file_count = pair_count;
+    stats.total_bytes = total_bytes;
+    stats.total_tokens = total_tokens;
+    stats.elapsed_ms = elapsed_s * 1000.0;
+    stats.compression_ratio = (total_tokens > 0) ? (static_cast<double>(total_bytes) / total_tokens) : 0.0;
+    stats.throughput_mb_s = (elapsed_s > 0) ? ((total_bytes / (1024.0 * 1024.0)) / elapsed_s) : 0.0;
+    stats.tokens_per_sec = (elapsed_s > 0) ? (total_tokens / elapsed_s) : 0.0;
+
+    std::cout << "--------------------------------------------------------------------\n";
+    std::cout << "[Stream Instruct Completed]\n";
+    std::cout << "  Total Dialogue Pairs  : " << pair_count << " pairs\n";
+    std::cout << "  Total Raw Text Read   : " << std::fixed << std::setprecision(2)
+              << (stats.total_bytes / 1024.0 / 1024.0) << " MB\n";
+    std::cout << "  Total Tokens Streamed : " << stats.total_tokens << " tokens ("
+              << (stats.total_tokens * sizeof(TokenId) / 1024.0 / 1024.0) << " MB binary)\n";
+    std::cout << "  Ingestion Speed       : " << std::fixed << std::setprecision(2)
+              << stats.throughput_mb_s << " MB/s (" << (stats.tokens_per_sec / 1000.0) << "K tok/s)\n";
+    std::cout << "  Elapsed Wall Time     : " << std::fixed << std::setprecision(2) << elapsed_s << " seconds\n";
+    std::cout << "====================================================================\n\n";
+
+    return stats;
+}
+
 IngestionStats Tokenizer::benchmark_ingestion(const std::filesystem::path& path) const {
     IngestionStats stats{};
     auto start_time = std::chrono::high_resolution_clock::now();

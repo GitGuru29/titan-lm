@@ -173,6 +173,16 @@ public:
         bool add_eos = true
     ) const;
 
+    // Phase 9: Conversational Instruction Streaming Ingestion Engine
+    // Streams JSON lines of {instruction, output} conversational pairs, wraps them
+    // inside the strict target chat template:
+    //   "<|user|>\n{instruction}\n<|assistant|>\n{output}<|end_of_text|>"
+    // and streams contiguous raw uint32_t BPE token bytes directly to disk with O(1) RAM.
+    IngestionStats stream_tokenize_chat_file(
+        const std::filesystem::path& input_path,
+        const std::filesystem::path& output_bin
+    ) const;
+
     // Recursively ingest a directory of source files into a contiguous flat token array
     [[nodiscard]] std::vector<TokenId> ingest_directory(
         const std::filesystem::path& dir_path,

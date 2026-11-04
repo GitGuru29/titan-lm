@@ -6,6 +6,8 @@
 !titan_vocab.txt
 *.log
 titan_lm
+build_tools/
+*.parquet
 
 # OS artifacts
 .DS_Store

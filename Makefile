@@ -36,12 +36,24 @@ test: $(TARGET)
 	./$(TARGET)
 
 train: $(TARGET)
-	@echo "==> Launching Full Titan-LM Training Loop (d_model=256, 6 layers, 2000 steps)..."
+	@echo "==> Launching Full Titan-LM Training Loop (d_model=512, 12 layers, 10000 steps)..."
 	./$(TARGET) train
+
+train-instruct: $(TARGET)
+	@echo "==> Launching Phase 9 Instruction Fine-Tuning & Alignment Loop..."
+	./$(TARGET) train_instruct
 
 ingest: $(TARGET)
 	@echo "==> Running Data Ingestion Pipeline..."
 	bash ingest.sh
+
+ingest-instruct: $(TARGET)
+	@echo "==> Running Conversational Instruction Ingestion Pipeline..."
+	bash ingest_instruct.sh
+
+chat: $(TARGET)
+	@echo "==> Interactive Conversational Dialogue..."
+	./$(TARGET) chat "Write a clean C++ template for a thread-safe singleton."
 
 generate: $(TARGET)
 	@echo "==> Running Autoregressive Code Generation Stream..."

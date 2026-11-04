@@ -570,6 +570,89 @@ int main(int argc, char* argv[]) {
             return 0;
         }
 
+        if (command == "stream-instruct" && argc >= 3) {
+            std::filesystem::path input_file = argv[2];
+            std::filesystem::path output_bin = (argc >= 4) ? argv[3] : "titan_instruct_tokens.bin";
+            tokenizer.stream_tokenize_chat_file(input_file, output_bin);
+            return 0;
+        }
+
+        if (command == "train_instruct" || command == "train-instruct") {
+            const size_t vocab_size = tokenizer.vocab_size();
+            const size_t d_model    = 512;
+            const size_t num_layers = 12;
+            const size_t n_heads    = 8;
+            const size_t max_seq    = 256;
+
+            std::cout << "\n====================================================================\n";
+            std::cout << "  TITAN-LM Phase 9: Conversational Alignment & Instruction Fine-Tuning\n";
+            std::cout << "====================================================================\n";
+            std::cout << "  Model Config: 42.15M params (d_model=512, 12 layers, 8 heads, max_seq=256)\n";
+            std::cout << "  Active Vocab: " << vocab_size << " BPE tokens\n";
+
+            titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
+
+            // 1. Safeguard & protect base checkpoint weights
+            const std::string base_weights = "titan_weights.bin";
+            const std::string backup_base  = "titan_weights.base.bin";
+            const std::string instruct_weights = "titan_instruct_weights.bin";
+
+            if (std::filesystem::exists(base_weights)) {
+                // Create backup if not already present to preserve pre-trained base
+                if (!std::filesystem::exists(backup_base)) {
+                    std::error_code ec;
+                    std::filesystem::copy_file(base_weights, backup_base, std::filesystem::copy_options::overwrite_existing, ec);
+                    if (!ec) {
+                        std::cout << "  [Safety Protection] Base checkpoint archived → " << backup_base << "\n";
+                    }
+                } else {
+                    std::cout << "  [Safety Protection] Base checkpoint archive verified: " << backup_base << "\n";
+                }
+
+                // Load base weights into model for instruction alignment transfer learning
+                if (model.load_weights(base_weights)) {
+                    std::cout << "  [Transfer Learning] Successfully loaded base weights from " << base_weights << "\n";
+                } else {
+                    std::cout << "  [WARNING] Could not parse base weights. Initializing fresh parameters.\n";
+                }
+            } else {
+                std::cout << "  [INFO] No base weights found at " << base_weights << ". Starting with random initialization.\n";
+            }
+
+            // 2. Conversational Training Configuration
+            const std::string instruct_dataset = "titan_instruct_tokens.bin";
+            if (!std::filesystem::exists(instruct_dataset)) {
+                std::cerr << "\n[ERROR] Conversational dataset not found: " << instruct_dataset << "\n";
+                std::cerr << "Run './ingest_instruct.sh' first to download and stream instruction tokens.\n";
+                return 1;
+            }
+
+            titan::TrainingConfig config;
+            config.dataset_path        = instruct_dataset;
+            config.checkpoint_path     = instruct_weights;
+            config.batch_size          = 4;
+            config.seq_len             = 128;
+            config.max_steps           = 2000;    // Focused conversational fine-tuning
+            config.warmup_steps        = 100;     // Gentle warmup for instruction alignment
+            config.learning_rate       = 1e-4f;   // Lower peak LR to prevent catastrophic forgetting
+            config.min_learning_rate   = 1e-5f;   // Smooth cosine annealing floor
+            config.weight_decay        = 0.05f;
+            config.log_interval        = 25;      // Granular progress telemetry
+            config.checkpoint_interval = 100;     // Regular checkpointing
+
+            std::cout << "  Dataset File: " << config.dataset_path << "\n";
+            std::cout << "  Checkpoint  : " << config.checkpoint_path << "\n";
+            std::cout << "  Fine-Tuning : " << config.max_steps << " steps | Warmup: "
+                      << config.warmup_steps << " steps | Peak LR: " << config.learning_rate << "\n";
+            std::cout << "--------------------------------------------------------------------\n\n";
+
+            titan::Trainer trainer(model, tokenizer, config);
+            trainer.train();
+
+            std::cout << "\n[train_instruct] Alignment complete! Checkpoint saved → " << instruct_weights << "\n";
+            return 0;
+        }
+
         if (command == "generate" && argc >= 3) {
             std::string prompt = argv[2];
             // ── Must match the architecture saved in titan_weights.bin ──────
@@ -588,11 +671,19 @@ int main(int argc, char* argv[]) {
             if (argc >= 6) repetition_penalty = std::stof(argv[5]);
 
             titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
-            if (std::filesystem::exists("titan_weights.bin")) {
+            std::string weight_file = "titan_weights.bin";
+            if (std::filesystem::exists("titan_instruct_weights.bin")) {
+                weight_file = "titan_instruct_weights.bin";
+            }
+
+            if (std::filesystem::exists(weight_file)) {
+                model.load_weights(weight_file);
+                std::cout << "[generate] Loaded checkpoint: " << weight_file << "\n";
+            } else if (std::filesystem::exists("titan_weights.bin")) {
                 model.load_weights("titan_weights.bin");
                 std::cout << "[generate] Loaded checkpoint: titan_weights.bin\n";
             } else {
-                std::cout << "[generate] WARNING: No titan_weights.bin found. "
+                std::cout << "[generate] WARNING: No checkpoint found. "
                           << "Run 'make ingest && make train' first.\n";
             }
 
@@ -603,6 +694,40 @@ int main(int argc, char* argv[]) {
             std::cout << "\n──────────────────────────────────────────────────\n";
             model.generate(prompt, tokenizer, gen_tokens, temperature, 1337, true, repetition_penalty);
             std::cout << "\n──────────────────────────────────────────────────\n";
+            return 0;
+        }
+
+        if (command == "chat" && argc >= 3) {
+            std::string user_instruction = argv[2];
+            const size_t vocab_size = tokenizer.vocab_size();
+            const size_t d_model    = 512;
+            const size_t num_layers = 12;
+            const size_t n_heads    = 8;
+            const size_t max_seq    = 256;
+
+            size_t gen_tokens          = 256;
+            float  temperature         = 0.7f;
+            float  repetition_penalty  = 1.25f;
+            if (argc >= 4) gen_tokens         = static_cast<size_t>(std::stoul(argv[3]));
+            if (argc >= 5) temperature        = std::stof(argv[4]);
+            if (argc >= 6) repetition_penalty = std::stof(argv[5]);
+
+            titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
+            std::string weight_file = "titan_instruct_weights.bin";
+            if (!std::filesystem::exists(weight_file)) {
+                weight_file = "titan_weights.bin";
+            }
+
+            if (std::filesystem::exists(weight_file)) {
+                model.load_weights(weight_file);
+                std::cout << "[chat] Loaded checkpoint: " << weight_file << "\n";
+            }
+
+            std::string prompt = "<|user|>\n" + user_instruction + "\n<|assistant|>\n";
+            std::cout << "\n──────────────── Conversational Dialogue ────────────────\n";
+            std::cout << "[User]: " << user_instruction << "\n\n[Assistant]:\n";
+            model.generate(prompt, tokenizer, gen_tokens, temperature, 1337, true, repetition_penalty);
+            std::cout << "\n──────────────────────────────────────────────────────────\n";
             return 0;
         }
 
@@ -626,7 +751,10 @@ int main(int argc, char* argv[]) {
         std::cout << "  " << argv[0] << "                                (runs full Phase 1-5 verification suite)\n";
         std::cout << "  " << argv[0] << " train-vocab [size] [file.txt]  (learns BPE merges up to target size)\n";
         std::cout << "  " << argv[0] << " tokenize <file.txt>            (BPE-encode file → titan_tokens.bin)\n";
-        std::cout << "  " << argv[0] << " train                          (launches complete AdamW training loop)\n";
+        std::cout << "  " << argv[0] << " train                          (launches base AdamW training loop on corpus)\n";
+        std::cout << "  " << argv[0] << " train_instruct                 (launches Phase 9 instruction alignment loop)\n";
+        std::cout << "  " << argv[0] << " stream-instruct <in> [out]     (streams chat template into binary tokens)\n";
+        std::cout << "  " << argv[0] << " chat \"<instruction>\"           (conversational dialogue inference)\n";
         std::cout << "  " << argv[0] << " generate <p> [N] [T] [rep]     (streams real-time code with repetition penalty)\n";
         std::cout << "  " << argv[0] << " benchmark .                    (runs system benchmarks)\n";
         return 1;
