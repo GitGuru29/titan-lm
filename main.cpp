@@ -71,7 +71,7 @@ void run_ingestion_verification(const titan::Tokenizer& tokenizer) {
         std::cerr << "  Roundtrip Integrity: MISMATCH DETECTED\n";
     }
 
-    const std::string out_bin = "titan_tokens.bin";
+    const std::string out_bin = "test_tokens.bin";
     std::vector<titan::TokenId> workspace_tokens;
     const std::vector<std::string> src_files = {
         "tokenizer.hpp", "tokenizer.cpp",

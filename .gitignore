@@ -4,6 +4,7 @@
 *.vocab
 *.txt
 !titan_vocab.txt
+*.log
 titan_lm
 
 # OS artifacts

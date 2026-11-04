@@ -141,7 +141,7 @@ void Trainer::train() {
     const size_t num_tokens = dataset.size();
     const size_t max_sample_offset = num_tokens - (config.seq_len + 1);
 
-    std::cout << "  Dataset File: " << config.checkpoint_path << " (" << num_tokens << " mapped tokens)\n";
+    std::cout << "  Dataset File: " << config.dataset_path << " (" << num_tokens << " mapped tokens)\n";
     std::cout << "  Model Parameters: " << model.parameter_count() << " parameters\n";
     std::cout << "  Context Length: " << config.seq_len << " tokens | Micro-Batch: " << config.batch_size << "\n";
     std::cout << "  Optimization Steps: " << config.max_steps << " | Warmup: " << config.warmup_steps << " steps\n";
