@@ -6,6 +6,8 @@
 
 #include <iostream>
 #include <iomanip>
+#include <fstream>
+#include <filesystem>
 #include <vector>
 #include <string>
 #include <thread>
@@ -401,23 +403,80 @@ int main(int argc, char* argv[]) {
     if (argc >= 2) {
         std::string command = argv[1];
 
+        // ── tokenize <input_file> [output_bin] ──────────────────────────────
+        // Reads any raw text file, encodes via BPE, writes titan_tokens.bin
+        if (command == "tokenize" && argc >= 3) {
+            std::filesystem::path input_path = argv[2];
+            std::filesystem::path output_bin = (argc >= 4) ? argv[3] : "titan_tokens.bin";
+
+            if (!std::filesystem::exists(input_path)) {
+                std::cerr << "[ERROR] Input file not found: " << input_path << "\n";
+                return 1;
+            }
+
+            const size_t file_bytes = std::filesystem::file_size(input_path);
+            std::cout << "[tokenize] Input  : " << input_path
+                      << " (" << (file_bytes / 1024.0 / 1024.0) << " MB)\n";
+            std::cout << "[tokenize] Output : " << output_bin << "\n";
+            std::cout << "[tokenize] Vocab  : " << tokenizer.vocab_size() << " tokens\n\n";
+
+            // Read entire file into memory
+            std::ifstream fin(input_path, std::ios::binary);
+            if (!fin) {
+                std::cerr << "[ERROR] Cannot open input file\n";
+                return 1;
+            }
+            std::string raw_text((std::istreambuf_iterator<char>(fin)),
+                                  std::istreambuf_iterator<char>());
+            fin.close();
+
+            std::cout << "[tokenize] Encoding " << raw_text.size()
+                      << " characters...\n";
+
+            auto t0 = std::chrono::high_resolution_clock::now();
+            std::vector<titan::TokenId> tokens = tokenizer.encode(raw_text, true, true);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
+
+            std::cout << "[tokenize] Done. " << tokens.size() << " tokens in "
+                      << std::fixed << std::setprecision(2) << elapsed_s << "s"
+                      << " (" << (tokens.size() / elapsed_s / 1000.0) << "K tok/s)\n";
+
+            // Save binary
+            tokenizer.save_tokens_binary(output_bin, tokens);
+            const size_t out_bytes = std::filesystem::file_size(output_bin);
+            std::cout << "[tokenize] Saved " << out_bytes << " bytes → " << output_bin << "\n";
+            std::cout << "[tokenize] ✓ Ready to train. Run: make train\n";
+            return 0;
+        }
+
         if (command == "train") {
             const size_t vocab_size = tokenizer.vocab_size();
-            const size_t d_model = 128;
-            const size_t num_layers = 4;
-            const size_t n_heads = 8;
-            const size_t max_seq = 64;
+            // ── Production training config ──────────────────────────────────
+            // Scaled up for a real corpus (larger model, longer sequences,
+            // more steps, cosine-decayed LR with warmup)
+            const size_t d_model    = 256;   // was 128 — doubled hidden dim
+            const size_t num_layers = 6;     // was 4  — deeper transformer
+            const size_t n_heads    = 8;
+            const size_t max_seq    = 128;   // was 64  — longer context window
+
+            std::cout << "\n[train] Model config:\n";
+            std::cout << "  vocab_size  = " << vocab_size  << "\n";
+            std::cout << "  d_model     = " << d_model     << "\n";
+            std::cout << "  num_layers  = " << num_layers  << "\n";
+            std::cout << "  n_heads     = " << n_heads     << "\n";
+            std::cout << "  max_seq     = " << max_seq     << "\n\n";
 
             titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
 
             titan::TrainingConfig config;
-            config.batch_size = 4;
-            config.seq_len = 32;
-            config.max_steps = 100;
-            config.warmup_steps = 10;
-            config.learning_rate = 1e-3f;
-            config.log_interval = 10;
-            config.checkpoint_interval = 25;
+            config.batch_size          = 8;       // was 4
+            config.seq_len             = 64;      // was 32
+            config.max_steps           = 2000;    // was 100  — real training run
+            config.warmup_steps        = 100;     // was 10
+            config.learning_rate       = 3e-4f;   // standard Karpathy LR
+            config.log_interval        = 50;
+            config.checkpoint_interval = 200;
 
             titan::Trainer trainer(model, tokenizer, config);
             trainer.train();
@@ -426,22 +485,31 @@ int main(int argc, char* argv[]) {
 
         if (command == "generate" && argc >= 3) {
             std::string prompt = argv[2];
+            // ── Must match the architecture saved in titan_weights.bin ──────
             const size_t vocab_size = tokenizer.vocab_size();
-            const size_t d_model = 128;
-            const size_t num_layers = 4;
-            const size_t n_heads = 8;
-            const size_t max_seq = 64;
+            const size_t d_model    = 256;
+            const size_t num_layers = 6;
+            const size_t n_heads    = 8;
+            const size_t max_seq    = 128;
+
+            // Optional: temperature as 3rd arg, e.g. ./titan_lm generate "int main" 0.7
+            float temperature = 0.8f;
+            if (argc >= 5) temperature = std::stof(argv[4]);
 
             titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
             if (std::filesystem::exists("titan_weights.bin")) {
                 model.load_weights("titan_weights.bin");
-                std::cout << "Loaded checkpoint from titan_weights.bin\n";
+                std::cout << "[generate] Loaded checkpoint: titan_weights.bin\n";
+            } else {
+                std::cout << "[generate] WARNING: No titan_weights.bin found. "
+                          << "Using random weights — run 'make train' first.\n";
             }
 
-            std::cout << "Streaming generation for: \"" << prompt << "\"\n";
-            std::cout << "--------------------------------------------------\n";
-            model.generate(prompt, tokenizer, 64, 0.8f, 1337, true);
-            std::cout << "\n--------------------------------------------------\n";
+            std::cout << "[generate] Prompt      : \"" << prompt << "\"\n";
+            std::cout << "[generate] Temperature : " << temperature << "\n";
+            std::cout << "\n──────────────────────────────────────────────────\n";
+            model.generate(prompt, tokenizer, 128, temperature, 1337, true);
+            std::cout << "\n──────────────────────────────────────────────────\n";
             return 0;
         }
 
@@ -462,10 +530,11 @@ int main(int argc, char* argv[]) {
 
         std::cerr << "Unknown command: " << command << "\n";
         std::cout << "Usage:\n";
-        std::cout << "  " << argv[0] << "              (runs full Phase 1-5 verification suite)\n";
-        std::cout << "  " << argv[0] << " train        (launches complete AdamW training loop)\n";
-        std::cout << "  " << argv[0] << " generate <s> (streams real-time autoregressive code tokens)\n";
-        std::cout << "  " << argv[0] << " benchmark .  (runs system benchmarks)\n";
+        std::cout << "  " << argv[0] << "                        (runs full Phase 1-5 verification suite)\n";
+        std::cout << "  " << argv[0] << " tokenize <file.txt>    (BPE-encode file → titan_tokens.bin)\n";
+        std::cout << "  " << argv[0] << " train                  (launches complete AdamW training loop)\n";
+        std::cout << "  " << argv[0] << " generate <prompt> [T]  (streams real-time code, optional temp)\n";
+        std::cout << "  " << argv[0] << " benchmark .            (runs system benchmarks)\n";
         return 1;
     }
 
