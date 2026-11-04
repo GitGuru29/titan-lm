@@ -13,6 +13,7 @@
 #include <thread>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <Accelerate/Accelerate.h>
 
 namespace {
@@ -454,17 +455,40 @@ int main(int argc, char* argv[]) {
                     roots.emplace_back(argv[i]);
                 }
             } else {
-                // Default search paths: ~/titan_massive_dataset, ~/titan_dataset, Desktop projects
-                const char* home = std::getenv("HOME");
-                if (home) {
-                    std::filesystem::path p_massive = std::filesystem::path(home) / "titan_massive_dataset";
-                    if (std::filesystem::exists(p_massive)) roots.push_back(p_massive);
-                    std::filesystem::path p_data = std::filesystem::path(home) / "titan_dataset";
-                    if (std::filesystem::exists(p_data)) roots.push_back(p_data);
+                // Portable defaults: TITAN_CORPUS_DIR (or ~/titan_massive_dataset) plus
+                // ~/titan_dataset, with optional colon-separated TITAN_LOCAL_PROJECTS.
+                auto add_root = [&roots](const std::filesystem::path& p) {
+                    std::error_code ec;
+                    if (std::filesystem::is_directory(p, ec)) roots.push_back(p);
+                };
+
+                if (const char* corpus_env = std::getenv("TITAN_CORPUS_DIR"); corpus_env && *corpus_env) {
+                    add_root(corpus_env);
+                } else if (const char* home = std::getenv("HOME")) {
+                    add_root(std::filesystem::path(home) / "titan_massive_dataset");
                 }
-                roots.emplace_back("/Users/siluna/Desktop/titan-lm");
-                roots.emplace_back("/Users/siluna/Desktop/AeroDrop");
-                roots.emplace_back("/Users/siluna/Desktop/AeroSec");
+
+                if (const char* home = std::getenv("HOME")) {
+                    add_root(std::filesystem::path(home) / "titan_dataset");
+                }
+
+                if (const char* extra = std::getenv("TITAN_LOCAL_PROJECTS"); extra && *extra) {
+                    const std::string list(extra);
+                    size_t start = 0;
+                    while (start <= list.size()) {
+                        const size_t sep = list.find(':', start);
+                        const std::string item = list.substr(
+                            start, sep == std::string::npos ? std::string::npos : sep - start);
+                        if (!item.empty()) add_root(item);
+                        if (sep == std::string::npos) break;
+                        start = sep + 1;
+                    }
+                }
+
+                if (roots.empty()) {
+                    std::cerr << "[stream-ingest] No corpus roots found. Set TITAN_CORPUS_DIR "
+                                 "or pass directories explicitly.\n";
+                }
             }
 
             tokenizer.stream_tokenize_directories(roots, output_bin);
@@ -556,14 +580,33 @@ int main(int argc, char* argv[]) {
 
             titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
 
+            // Safeguard & continuous pre-training on expanded corpus
+            const std::string base_weights = "titan_weights.bin";
+            const std::string backup_prev  = "titan_weights.prev.bin";
+            if (std::filesystem::exists(base_weights)) {
+                std::error_code ec;
+                std::filesystem::copy_file(base_weights, backup_prev, std::filesystem::copy_options::overwrite_existing, ec);
+                if (!ec) {
+                    std::cout << "  [Checkpoint Safety] Existing weights archived → " << backup_prev << "\n";
+                }
+                if (model.load_weights(base_weights)) {
+                    std::cout << "  [Continuous Pre-training] Successfully loaded existing weights from " << base_weights << "\n";
+                } else {
+                    std::cout << "  [WARNING] Could not parse existing checkpoint. Starting fresh initialization.\n";
+                }
+            } else {
+                std::cout << "  [INFO] No existing weights found. Starting random initialization.\n";
+            }
+
             titan::TrainingConfig config;
-            config.batch_size          = 4;       // smaller batch — model is 10x bigger
+            config.batch_size          = 4;       // micro-batch size
             config.seq_len             = 128;     // half of max_seq (safe sliding window)
-            config.max_steps           = 10000;   // 10K steps on the full corpus
-            config.warmup_steps        = 500;     // longer warmup for stable 50M init
-            config.learning_rate       = 3e-4f;   // Karpathy canonical LR
-            config.log_interval        = 100;
-            config.checkpoint_interval = 500;
+            config.max_steps           = 10000;   // 10K optimization steps
+            config.warmup_steps        = 500;     // linear warmup
+            config.learning_rate       = 2e-4f;   // stable rate for continuous pre-training
+            config.min_learning_rate   = 2e-5f;   // cosine decay floor
+            config.log_interval        = 50;      // telemetry interval
+            config.checkpoint_interval = 500;     // checkpoint save interval
 
             titan::Trainer trainer(model, tokenizer, config);
             trainer.train();

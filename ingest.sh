@@ -48,11 +48,13 @@ else
 fi
 
 # ── Step 2: Define Target Codebases for Ingestion ─────────────────────────────
+# The harvested corpus can live on any volume: set TITAN_CORPUS_DIR for the main
+# root and TITAN_LOCAL_PROJECTS (colon-separated) for extra project trees.
+CORPUS_DIR="${TITAN_CORPUS_DIR:-${HOME}/titan_massive_dataset}"
 TARGET_DIRS=()
 
-# Massive dataset (LLVM, Linux Kernel, TensorFlow, OpenCV, Qt5)
-if [[ -d "${HOME}/titan_massive_dataset" ]]; then
-    TARGET_DIRS+=("${HOME}/titan_massive_dataset")
+if [[ -d "${CORPUS_DIR}" ]]; then
+    TARGET_DIRS+=("${CORPUS_DIR}")
 fi
 
 # Specialized systems dataset (Folly, Seastar, Abseil, LLaMA.cpp, etc.)
@@ -60,18 +62,21 @@ if [[ -d "${HOME}/titan_dataset" ]]; then
     TARGET_DIRS+=("${HOME}/titan_dataset")
 fi
 
-# Local active project trees
-for local_proj in \
-    "/Users/siluna/Desktop/titan-lm" \
-    "/Users/siluna/Desktop/AeroDrop" \
-    "/Users/siluna/Desktop/AeroSec"
-do
-    if [[ -d "$local_proj" ]]; then
-        TARGET_DIRS+=("$local_proj")
+# Local project trees — defaults to this repository, override with
+# TITAN_LOCAL_PROJECTS="/path/a:/path/b"
+LOCAL_PROJECTS="${TITAN_LOCAL_PROJECTS:-${SCRIPT_DIR}}"
+IFS=':' read -r -a LOCAL_PROJECT_LIST <<< "${LOCAL_PROJECTS}"
+for local_proj in "${LOCAL_PROJECT_LIST[@]}"; do
+    if [[ -d "${local_proj}" ]]; then
+        TARGET_DIRS+=("${local_proj}")
     fi
 done
 
-log "Corpus roots to stream:"
+if (( ${#TARGET_DIRS[@]} == 0 )); then
+    die "No corpus roots found. Harvest a corpus with ./harvest_huge_corpus.sh or set TITAN_CORPUS_DIR."
+fi
+
+log "Corpus roots to stream (set TITAN_CORPUS_DIR / TITAN_LOCAL_PROJECTS to relocate):"
 for d in "${TARGET_DIRS[@]}"; do
     echo -e "  ${CYAN}•${NC} $d ($(du -sh "$d" 2>/dev/null | awk '{print $1}'))"
 done

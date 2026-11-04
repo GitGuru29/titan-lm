@@ -146,15 +146,37 @@ Run the built-in phase verification suite to validate Accelerate BLAS dot-produc
 ## Dataset Ingestion & Training
 
 ### 1. Harvest Open-Source Codebases (Optional)
-Clone shallow copies of production C++ repositories into `~/titan_massive_dataset`:
+Shallow-clone production C++ repositories into a corpus root of your choice. The corpus
+reaches tens of GB, so keep it on a volume with room to spare (e.g. an external SSD) rather
+than the boot disk:
 
 ```bash
 chmod +x harvest_huge_corpus.sh
+
+# Default root: ~/titan_massive_dataset
 ./harvest_huge_corpus.sh
+
+# Or place the corpus on another volume (4 parallel clone workers by default)
+TITAN_CORPUS_DIR=/Volumes/SSD/titan_corpus TITAN_JOBS=8 ./harvest_huge_corpus.sh
+```
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TITAN_CORPUS_DIR` | `~/titan_massive_dataset` | Where the harvested repos live and are read from |
+| `TITAN_JOBS` | `4` | Parallel clone workers |
+| `TITAN_MIN_FREE_GB` | `10` | Warn when the corpus volume has less free space |
+| `TITAN_LOCAL_PROJECTS` | this repository | Colon-separated extra trees to tokenize |
+
+To relocate an existing corpus, move the directory and point the variable at the new path
+— no code or script edits are needed:
+
+```bash
+rsync -a --info=progress2 ~/titan_massive_dataset/ /Volumes/SSD/titan_corpus/
+export TITAN_CORPUS_DIR=/Volumes/SSD/titan_corpus
 ```
 
 ### 2. Run Memory-Flat Streaming Ingestion
-Stream and tokenize files directly into `titan_tokens.bin`:
+Stream and tokenize files directly into `titan_tokens.bin` (honours `TITAN_CORPUS_DIR`):
 
 ```bash
 make ingest
