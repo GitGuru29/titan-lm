@@ -14,7 +14,7 @@ SRCS        := main.cpp tokenizer.cpp tensor.cpp attention.cpp model.cpp trainer
 OBJS        := $(SRCS:.cpp=.o)
 DEPS        := tokenizer.hpp tensor.hpp attention.hpp model.hpp trainer.hpp governor.hpp
 
-.PHONY: all clean run benchmark test help train generate ingest
+.PHONY: all clean run benchmark test help train generate ingest export-fp16
 
 all: $(TARGET)
 
@@ -54,6 +54,11 @@ ingest-instruct: $(TARGET)
 chat: $(TARGET)
 	@echo "==> Interactive Conversational Dialogue..."
 	./$(TARGET) chat "Write a clean C++ template for a thread-safe singleton."
+
+export-fp16: $(TARGET)
+	@echo "==> Exporting Model Checkpoints to FP16 Half-Precision..."
+	./$(TARGET) export-fp16 titan_instruct_weights.bin titan_instruct_fp16.bin
+	./$(TARGET) export-fp16 titan_weights.bin titan_weights_fp16.bin
 
 generate: $(TARGET)
 	@echo "==> Running Autoregressive Code Generation Stream..."
