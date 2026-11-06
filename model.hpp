@@ -135,6 +135,10 @@ public:
     // 6. Y       = X_mid + X_ffn        (Second Residual Stream)
     [[nodiscard]] Tensor forward(const Tensor& X);
 
+    // KV-Cache forward passes for fast autoregressive inference
+    [[nodiscard]] Tensor forward_prefill(const Tensor& X, KVCache& kv_cache);
+    [[nodiscard]] Tensor forward_decode(const Tensor& X_single, KVCache& kv_cache, size_t pos);
+
     // Deep Autograd Traversal Backward Pass:
     // Routes gradients down through the dual residual connections and LayerNorm operators,
     // accumulating parameter gradients across all sub-layers without dropping branches.
@@ -148,6 +152,32 @@ public:
     [[nodiscard]] size_t parameter_count() const noexcept {
         return ln_1.parameter_count() + attn.parameter_count() +
                ln_2.parameter_count() + ffn.parameter_count();
+    }
+};
+
+// ============================================================================
+// Multi-Layer Model KV-Cache for Autoregressive Generation
+// ============================================================================
+struct ModelKVCache {
+    std::vector<KVCache> layers;
+    size_t max_seq_len{0};
+    size_t d_model{0};
+
+    void init(size_t num_layers, size_t max_seq, size_t dim) {
+        max_seq_len = max_seq;
+        d_model = dim;
+        layers.resize(num_layers);
+        for (auto& l : layers) {
+            l.k = Tensor(max_seq, dim, 0.0f);
+            l.v = Tensor(max_seq, dim, 0.0f);
+            l.length = 0;
+        }
+    }
+
+    void clear() noexcept {
+        for (auto& l : layers) {
+            l.clear();
+        }
     }
 };
 
@@ -175,6 +205,9 @@ public:
     // Language Model Head Projection (d_model x vocab_size)
     Tensor lm_head;
 
+    // Autoregressive Generation KV-Cache
+    ModelKVCache kv_cache;
+
     // Forward Cache for multi-layer backpropagation
     std::vector<Tensor> layer_inputs;
     Tensor cached_final_norm;
@@ -193,6 +226,13 @@ public:
 
     // Forward pass taking integer token sequence -> logits (T x vocab_size)
     [[nodiscard]] Tensor forward(const std::vector<uint32_t>& tokens);
+
+    // Fast KV-Cache Autoregressive Inference passes:
+    // Prefill: caches all prompt tokens in a single parallel pass, returns logits (T x vocab_size)
+    [[nodiscard]] Tensor forward_prefill(const std::vector<uint32_t>& tokens);
+
+    // Decode: computes single token at position pos in O(pos) time, returns logits (1 x vocab_size)
+    [[nodiscard]] Tensor forward_decode(uint32_t token, size_t pos);
 
     // Backward pass taking upstream grad_logits -> backpropagates through LM head, blocks & embeddings
     void backward(const Tensor& grad_logits);

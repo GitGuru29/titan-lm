@@ -6,7 +6,7 @@
 # ==============================================================================
 
 CXX         := clang++
-CXXFLAGS    := -std=c++20 -O3 -mcpu=apple-m4 -DACCELERATE_NEW_LAPACK -framework Accelerate -Wall -Wextra -Wpedantic -Wshadow -Qunused-arguments
+CXXFLAGS    := -std=c++20 -O3 -mcpu=apple-m4 -fblocks -DACCELERATE_NEW_LAPACK -Wno-deprecated-declarations -framework Accelerate -Wall -Wextra -Wpedantic -Wshadow -Qunused-arguments
 LDFLAGS     := -framework Accelerate -framework IOKit -framework CoreFoundation -framework CoreGraphics
 
 TARGET      := titan_lm

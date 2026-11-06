@@ -28,6 +28,18 @@ struct AttentionCache {
 };
 
 // ============================================================================
+// Autoregressive Key-Value Cache (O(1) Step Decoding)
+// ============================================================================
+struct KVCache {
+    Tensor k;          // Key cache buffer (max_seq_len x d_model)
+    Tensor v;          // Value cache buffer (max_seq_len x d_model)
+    size_t length{0};  // Current number of cached token states
+
+    void clear() noexcept { length = 0; }
+    [[nodiscard]] bool empty() const noexcept { return length == 0; }
+};
+
+// ============================================================================
 // Causal Multi-Head Self-Attention Core
 // ============================================================================
 class CausalAttention {
@@ -68,6 +80,16 @@ public:
     // applies upper-triangular causal mask (-1e9f for j > i), Softmax probabilities,
     // head-value dot-product (A x V), head concatenation, and final output projection (W_o).
     [[nodiscard]] Tensor forward(const Tensor& X);
+
+    // Forward Causal Attention with KV-Cache (Prefill Phase):
+    // Computes Q, K, V for all prompt tokens, stores K and V into kv_cache,
+    // and returns causal attention output (T x d_model)
+    [[nodiscard]] Tensor forward_prefill(const Tensor& X, KVCache& kv_cache);
+
+    // Forward Causal Attention with KV-Cache (Decode Phase):
+    // Computes q, k, v for a single new token, appends k and v to kv_cache at row pos,
+    // attends over cached keys and values, and returns output (1 x d_model) in O(pos) time
+    [[nodiscard]] Tensor forward_decode(const Tensor& X_single, KVCache& kv_cache, size_t pos);
 
     // Backward Causal Attention:
     // Propagates upstream gradients through W_o, concatenation, per-head values,

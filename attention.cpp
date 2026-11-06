@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <cassert>
 #include <Accelerate/Accelerate.h>
+#include <dispatch/dispatch.h>
 
 namespace titan {
 
@@ -121,19 +122,23 @@ Tensor CausalAttention::forward(const Tensor& X) {
     cache.head_outputs.resize(n_heads);
 
     Tensor concat_heads(T, d_model, 0.0f);
+    float* concat_ptr = concat_heads.data_ptr();
+    const float* Q_ptr = cache.Q.data_ptr();
+    const float* K_ptr = cache.K.data_ptr();
+    const float* V_ptr = cache.V.data_ptr();
+    const size_t head_bytes = head_dim * sizeof(float);
 
-    for (size_t h = 0; h < n_heads; ++h) {
+    dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    dispatch_apply(n_heads, queue, ^(size_t h) {
         Tensor Q_h(T, head_dim);
         Tensor K_h(T, head_dim);
         Tensor V_h(T, head_dim);
 
-        // Extract head slices
+        // Vectorized extraction of head slices
         for (size_t t = 0; t < T; ++t) {
-            for (size_t c = 0; c < head_dim; ++c) {
-                Q_h(t, c) = cache.Q(t, h * head_dim + c);
-                K_h(t, c) = cache.K(t, h * head_dim + c);
-                V_h(t, c) = cache.V(t, h * head_dim + c);
-            }
+            std::memcpy(Q_h.data_ptr() + t * head_dim, Q_ptr + t * d_model + h * head_dim, head_bytes);
+            std::memcpy(K_h.data_ptr() + t * head_dim, K_ptr + t * d_model + h * head_dim, head_bytes);
+            std::memcpy(V_h.data_ptr() + t * head_dim, V_ptr + t * d_model + h * head_dim, head_bytes);
         }
 
         // AMX Scaled Dot-Product: Scores = (Q_h x K_h^T) * scale
@@ -184,11 +189,9 @@ Tensor CausalAttention::forward(const Tensor& X) {
             static_cast<int>(head_dim)
         );
 
-        // Assemble into contiguous concatenated head tensor
+        // Vectorized assemble into contiguous concatenated head tensor
         for (size_t t = 0; t < T; ++t) {
-            for (size_t c = 0; c < head_dim; ++c) {
-                concat_heads(t, h * head_dim + c) = head_out_h(t, c);
-            }
+            std::memcpy(concat_ptr + t * d_model + h * head_dim, head_out_h.data_ptr() + t * head_dim, head_bytes);
         }
 
         cache.Q_heads[h] = std::move(Q_h);
@@ -197,11 +200,164 @@ Tensor CausalAttention::forward(const Tensor& X) {
         cache.scores[h] = std::move(scores_h);
         cache.weights[h] = std::move(weights_h);
         cache.head_outputs[h] = std::move(head_out_h);
-    }
+    });
 
     cache.concat_heads = concat_heads;
 
     // 3. Final Linear Output Projection: Y = concat_heads x W_o + b_o
+    Tensor out_proj = Tensor::matmul(concat_heads, W_o);
+    return Tensor::add_bias(out_proj, b_o);
+}
+
+Tensor CausalAttention::forward_prefill(const Tensor& X, KVCache& kv_cache) {
+    if (X.cols != d_model) {
+        throw std::invalid_argument("Input tensor feature dimension must match d_model");
+    }
+
+    const size_t T = X.rows;
+    if (T > max_seq_len) {
+        throw std::invalid_argument("Sequence length exceeds max_seq_len in forward_prefill");
+    }
+
+    // 1. Compute Linear Projections: Q, K, V
+    Tensor Q_proj = Tensor::matmul(X, W_q);
+    Tensor Q = Tensor::add_bias(Q_proj, b_q);
+
+    Tensor K_proj = Tensor::matmul(X, W_k);
+    Tensor K = Tensor::add_bias(K_proj, b_k);
+
+    Tensor V_proj = Tensor::matmul(X, W_v);
+    Tensor V = Tensor::add_bias(V_proj, b_v);
+
+    // 2. Cache K and V for autoregressive decoding
+    if (kv_cache.k.rows < max_seq_len || kv_cache.k.cols != d_model) {
+        kv_cache.k = Tensor(max_seq_len, d_model, 0.0f);
+        kv_cache.v = Tensor(max_seq_len, d_model, 0.0f);
+    }
+    std::memcpy(kv_cache.k.data_ptr(), K.data_ptr(), T * d_model * sizeof(float));
+    std::memcpy(kv_cache.v.data_ptr(), V.data_ptr(), T * d_model * sizeof(float));
+    kv_cache.length = T;
+
+    // 3. Multi-Head Attention
+    Tensor concat_heads(T, d_model, 0.0f);
+    float* concat_ptr = concat_heads.data_ptr();
+    const float* Q_ptr = Q.data_ptr();
+    const float* K_ptr = K.data_ptr();
+    const float* V_ptr = V.data_ptr();
+    const size_t head_bytes = head_dim * sizeof(float);
+
+    dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    dispatch_apply(n_heads, queue, ^(size_t h) {
+        Tensor Q_h(T, head_dim);
+        Tensor K_h(T, head_dim);
+        Tensor V_h(T, head_dim);
+
+        for (size_t t = 0; t < T; ++t) {
+            std::memcpy(Q_h.data_ptr() + t * head_dim, Q_ptr + t * d_model + h * head_dim, head_bytes);
+            std::memcpy(K_h.data_ptr() + t * head_dim, K_ptr + t * d_model + h * head_dim, head_bytes);
+            std::memcpy(V_h.data_ptr() + t * head_dim, V_ptr + t * d_model + h * head_dim, head_bytes);
+        }
+
+        Tensor scores_h(T, T, 0.0f);
+        cblas_sgemm(
+            CblasRowMajor, CblasNoTrans, CblasTrans,
+            static_cast<int>(T), static_cast<int>(T), static_cast<int>(head_dim),
+            scale,
+            Q_h.data_ptr(), static_cast<int>(head_dim),
+            K_h.data_ptr(), static_cast<int>(head_dim),
+            0.0f,
+            scores_h.data_ptr(), static_cast<int>(T)
+        );
+
+        for (size_t r = 0; r < T; ++r) {
+            for (size_t c = r + 1; c < T; ++c) {
+                scores_h(r, c) = -1e9f;
+            }
+        }
+
+        Tensor weights_h = Tensor::forward_softmax(scores_h);
+
+        Tensor head_out_h(T, head_dim, 0.0f);
+        cblas_sgemm(
+            CblasRowMajor, CblasNoTrans, CblasNoTrans,
+            static_cast<int>(T), static_cast<int>(head_dim), static_cast<int>(T),
+            1.0f,
+            weights_h.data_ptr(), static_cast<int>(T),
+            V_h.data_ptr(), static_cast<int>(head_dim),
+            0.0f,
+            head_out_h.data_ptr(), static_cast<int>(head_dim)
+        );
+
+        for (size_t t = 0; t < T; ++t) {
+            std::memcpy(concat_ptr + t * d_model + h * head_dim, head_out_h.data_ptr() + t * head_dim, head_bytes);
+        }
+    });
+
+    Tensor out_proj = Tensor::matmul(concat_heads, W_o);
+    return Tensor::add_bias(out_proj, b_o);
+}
+
+Tensor CausalAttention::forward_decode(const Tensor& X_single, KVCache& kv_cache, size_t pos) {
+    if (X_single.rows != 1 || X_single.cols != d_model) {
+        throw std::invalid_argument("X_single must be of shape 1 x d_model");
+    }
+    if (pos >= max_seq_len) {
+        throw std::invalid_argument("pos exceeds max_seq_len in forward_decode");
+    }
+
+    // 1. Single Token Projections
+    Tensor q_proj = Tensor::matmul(X_single, W_q);
+    Tensor q = Tensor::add_bias(q_proj, b_q);
+
+    Tensor k_proj = Tensor::matmul(X_single, W_k);
+    Tensor k = Tensor::add_bias(k_proj, b_k);
+
+    Tensor v_proj = Tensor::matmul(X_single, W_v);
+    Tensor v = Tensor::add_bias(v_proj, b_v);
+
+    // 2. Append k, v to cache at position pos
+    std::memcpy(kv_cache.k.data_ptr() + pos * d_model, k.data_ptr(), d_model * sizeof(float));
+    std::memcpy(kv_cache.v.data_ptr() + pos * d_model, v.data_ptr(), d_model * sizeof(float));
+    kv_cache.length = pos + 1;
+
+    const size_t total_len = pos + 1;
+    Tensor concat_heads(1, d_model, 0.0f);
+    std::vector<float> scores(total_len);
+    std::vector<float> weights(total_len);
+
+    // 3. Multi-head decode attention over cached tokens
+    for (size_t h = 0; h < n_heads; ++h) {
+        const float* q_h = q.data_ptr() + h * head_dim;
+
+        // Vectorized dot-product between q_h and all cached keys for head h
+        for (size_t t = 0; t < total_len; ++t) {
+            const float* k_th = kv_cache.k.data_ptr() + t * d_model + h * head_dim;
+            float dot = 0.0f;
+            vDSP_dotpr(q_h, 1, k_th, 1, &dot, head_dim);
+            scores[t] = dot * scale;
+        }
+
+        // Numerical stable softmax over total_len scores
+        float max_score = -1e9f;
+        vDSP_maxv(scores.data(), 1, &max_score, total_len);
+        float neg_max = -max_score;
+        vDSP_vsadd(scores.data(), 1, &neg_max, weights.data(), 1, total_len);
+        int len_i = static_cast<int>(total_len);
+        vvexpf(weights.data(), weights.data(), &len_i);
+        float sum_exp = 0.0f;
+        vDSP_sve(weights.data(), 1, &sum_exp, total_len);
+        float inv_sum = 1.0f / (sum_exp > 0.0f ? sum_exp : 1e-12f);
+        vDSP_vsmul(weights.data(), 1, &inv_sum, weights.data(), 1, total_len);
+
+        // Weighted accumulation across cached values
+        for (size_t c = 0; c < head_dim; ++c) {
+            float acc = 0.0f;
+            vDSP_dotpr(weights.data(), 1, kv_cache.v.data_ptr() + h * head_dim + c, d_model, &acc, total_len);
+            concat_heads(0, h * head_dim + c) = acc;
+        }
+    }
+
+    // 4. Output Projection
     Tensor out_proj = Tensor::matmul(concat_heads, W_o);
     return Tensor::add_bias(out_proj, b_o);
 }
@@ -265,13 +421,17 @@ void CausalAttention::backward(const Tensor& grad_output, Tensor& grad_X) {
     Tensor dQ(T, d_model, 0.0f);
     Tensor dK(T, d_model, 0.0f);
     Tensor dV(T, d_model, 0.0f);
+    float* dQ_ptr = dQ.data_ptr();
+    float* dK_ptr = dK.data_ptr();
+    float* dV_ptr = dV.data_ptr();
+    const float* d_concat_ptr = d_concat.data_ptr();
+    const size_t head_bytes = head_dim * sizeof(float);
 
-    for (size_t h = 0; h < n_heads; ++h) {
+    dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    dispatch_apply(n_heads, queue, ^(size_t h) {
         Tensor d_head_out_h(T, head_dim);
         for (size_t t = 0; t < T; ++t) {
-            for (size_t c = 0; c < head_dim; ++c) {
-                d_head_out_h(t, c) = d_concat(t, h * head_dim + c);
-            }
+            std::memcpy(d_head_out_h.data_ptr() + t * head_dim, d_concat_ptr + t * d_model + h * head_dim, head_bytes);
         }
 
         // a. dV_h = weights_h^T x d_head_out_h
@@ -356,13 +516,11 @@ void CausalAttention::backward(const Tensor& grad_output, Tensor& grad_X) {
 
         // Concatenate back into full dQ, dK, dV tensors
         for (size_t t = 0; t < T; ++t) {
-            for (size_t c = 0; c < head_dim; ++c) {
-                dQ(t, h * head_dim + c) = dQ_h(t, c);
-                dK(t, h * head_dim + c) = dK_h(t, c);
-                dV(t, h * head_dim + c) = dV_h(t, c);
-            }
+            std::memcpy(dQ_ptr + t * d_model + h * head_dim, dQ_h.data_ptr() + t * head_dim, head_bytes);
+            std::memcpy(dK_ptr + t * d_model + h * head_dim, dK_h.data_ptr() + t * head_dim, head_bytes);
+            std::memcpy(dV_ptr + t * d_model + h * head_dim, dV_h.data_ptr() + t * head_dim, head_bytes);
         }
-    }
+    });
 
     // 3. Input Projections Backward (Q, K, V -> X)
 

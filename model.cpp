@@ -243,6 +243,24 @@ Tensor TransformerBlock::forward(const Tensor& X) {
     return Tensor::add(cache.X_mid, cache.X_ffn);
 }
 
+Tensor TransformerBlock::forward_prefill(const Tensor& X, KVCache& kv_cache) {
+    Tensor X_norm1 = ln_1.forward(X);
+    Tensor X_attn  = attn.forward_prefill(X_norm1, kv_cache);
+    Tensor X_mid   = Tensor::add(X, X_attn);
+    Tensor X_norm2 = ln_2.forward(X_mid);
+    Tensor X_ffn   = ffn.forward(X_norm2);
+    return Tensor::add(X_mid, X_ffn);
+}
+
+Tensor TransformerBlock::forward_decode(const Tensor& X_single, KVCache& kv_cache, size_t pos) {
+    Tensor X_norm1 = ln_1.forward(X_single);
+    Tensor X_attn  = attn.forward_decode(X_norm1, kv_cache, pos);
+    Tensor X_mid   = Tensor::add(X_single, X_attn);
+    Tensor X_norm2 = ln_2.forward(X_mid);
+    Tensor X_ffn   = ffn.forward(X_norm2);
+    return Tensor::add(X_mid, X_ffn);
+}
+
 void TransformerBlock::backward(const Tensor& grad_output, Tensor& grad_X) {
     const size_t T = cache.X.rows;
     if (grad_output.rows != T || grad_output.cols != d_model) {
@@ -406,6 +424,63 @@ Tensor TitanModel::forward(const std::vector<uint32_t>& tokens) {
 
     // 4. LM Head Projection: Logits = cached_final_norm x lm_head (T x vocab_size)
     return Tensor::matmul(cached_final_norm, lm_head);
+}
+
+Tensor TitanModel::forward_prefill(const std::vector<uint32_t>& tokens) {
+    const size_t T = tokens.size();
+    if (T == 0) return Tensor(0, vocab_size, 0.0f);
+    if (T > max_seq_len) {
+        throw std::invalid_argument("Prefill token count (" + std::to_string(T) + ") exceeds max_seq_len");
+    }
+
+    if (kv_cache.layers.empty() || kv_cache.max_seq_len != max_seq_len || kv_cache.d_model != d_model) {
+        kv_cache.init(num_layers, max_seq_len, d_model);
+    }
+    kv_cache.clear();
+
+    // 1. Embedding lookup & Positional addition: X = TokEmb + PosEmb
+    Tensor H(T, d_model, 0.0f);
+    for (size_t t = 0; t < T; ++t) {
+        uint32_t tok = tokens[t];
+        if (tok >= vocab_size) tok = 0;
+
+        const float* tok_src = token_embeddings.data_ptr() + tok * d_model;
+        const float* pos_src = pos_embeddings.data_ptr() + t * d_model;
+        float* dst = H.data_ptr() + t * d_model;
+
+        vDSP_vadd(tok_src, 1, pos_src, 1, dst, 1, d_model);
+    }
+
+    // 2. Transformer Blocks Prefill
+    for (size_t l = 0; l < num_layers; ++l) {
+        H = layers[l].forward_prefill(H, kv_cache.layers[l]);
+    }
+
+    // 3. Final Layer Normalization & LM Head Projection
+    Tensor H_norm = final_ln.forward(H);
+    return Tensor::matmul(H_norm, lm_head);
+}
+
+Tensor TitanModel::forward_decode(uint32_t token, size_t pos) {
+    if (pos >= max_seq_len) {
+        throw std::invalid_argument("Decode position (" + std::to_string(pos) + ") exceeds max_seq_len");
+    }
+    if (token >= vocab_size) token = 0;
+
+    // 1. Single Token Embedding lookup
+    Tensor H(1, d_model, 0.0f);
+    const float* tok_src = token_embeddings.data_ptr() + token * d_model;
+    const float* pos_src = pos_embeddings.data_ptr() + pos * d_model;
+    vDSP_vadd(tok_src, 1, pos_src, 1, H.data_ptr(), 1, d_model);
+
+    // 2. Transformer Blocks Decode
+    for (size_t l = 0; l < num_layers; ++l) {
+        H = layers[l].forward_decode(H, kv_cache.layers[l], pos);
+    }
+
+    // 3. Final Layer Normalization & LM Head
+    Tensor H_norm = final_ln.forward(H);
+    return Tensor::matmul(H_norm, lm_head);
 }
 
 void TitanModel::backward(const Tensor& grad_logits) {
@@ -613,19 +688,25 @@ std::string TitanModel::generate(
         "<|unk|>",            //  7 chars
     };
 
-    for (size_t step = 0; step < max_new_tokens; ++step) {
-        // ── Sliding context window ───────────────────────────────────────
-        std::vector<uint32_t> ctx_tokens;
-        if (tokens.size() > max_seq_len) {
-            ctx_tokens.assign(tokens.end() - max_seq_len, tokens.end());
-        } else {
-            ctx_tokens = tokens;
-        }
+    // ── Prefill prompt tokens into KV-Cache (single parallel pass!) ─────────
+    std::vector<uint32_t> initial_tokens = tokens;
+    if (initial_tokens.size() > max_seq_len) {
+        initial_tokens.assign(initial_tokens.end() - max_seq_len, initial_tokens.end());
+    }
 
-        // ── Forward pass → logits for the final position ─────────────────
-        Tensor logits = forward(ctx_tokens);
-        const size_t T = ctx_tokens.size();
-        const float* next_logits = logits.data_ptr() + (T - 1) * vocab_size;
+    Tensor prompt_logits = forward_prefill(initial_tokens);
+    size_t curr_pos = initial_tokens.size();
+    Tensor decode_logits;
+    const float* next_logits = prompt_logits.data_ptr() + (curr_pos - 1) * vocab_size;
+
+    for (size_t step = 0; step < max_new_tokens; ++step) {
+        if (step > 0) {
+            if (curr_pos >= max_seq_len) break; // Context window limit reached
+            TokenId last_tok = tokens.back();
+            decode_logits = forward_decode(last_tok, curr_pos);
+            next_logits = decode_logits.data_ptr();
+            curr_pos++;
+        }
 
         // ── Repetition & Frequency Penalty (Move 1) ───────────────────────
         // Active sequence tracking log: count frequencies over sliding window
