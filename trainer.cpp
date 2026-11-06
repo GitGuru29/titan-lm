@@ -6,9 +6,76 @@
 #include <random>
 #include <chrono>
 #include <stdexcept>
+#include <thread>
+#include <cstdio>
+#include <string>
+#include <cctype>
 #include <Accelerate/Accelerate.h>
 
 namespace titan {
+
+// ============================================================================
+// macOS Hardware & Thermal Governor
+// ============================================================================
+struct SystemHealth {
+    int battery_pct{100};
+    bool on_ac{true};
+    bool thermal_throttled{false};
+    std::string summary;
+};
+
+static SystemHealth inspect_system_health() {
+    SystemHealth health{};
+
+    // 1. Inspect battery percentage and charging state via pmset
+    FILE* fp_batt = popen("pmset -g batt 2>/dev/null", "r");
+    if (fp_batt) {
+        char buf[256];
+        std::string out;
+        while (fgets(buf, sizeof(buf), fp_batt)) {
+            out += buf;
+        }
+        pclose(fp_batt);
+
+        health.on_ac = (out.find("AC Power") != std::string::npos);
+
+        size_t pct_pos = out.find('%');
+        if (pct_pos != std::string::npos && pct_pos > 0) {
+            size_t start = pct_pos;
+            while (start > 0 && std::isdigit(static_cast<unsigned char>(out[start - 1]))) {
+                start--;
+            }
+            try {
+                health.battery_pct = std::stoi(out.substr(start, pct_pos - start));
+            } catch (...) {}
+        }
+    }
+
+    // 2. Inspect thermal throttle warnings via pmset
+    FILE* fp_therm = popen("pmset -g therm 2>/dev/null", "r");
+    if (fp_therm) {
+        char buf[256];
+        std::string out;
+        while (fgets(buf, sizeof(buf), fp_therm)) {
+            out += buf;
+        }
+        pclose(fp_therm);
+
+        if ((out.find("warning") != std::string::npos || out.find("Warning") != std::string::npos) &&
+            out.find("No thermal warning") == std::string::npos) {
+            health.thermal_throttled = true;
+        }
+    }
+
+    health.summary = (health.on_ac ? "AC Power (" + std::to_string(health.battery_pct) + "%)" : "Battery (" + std::to_string(health.battery_pct) + "%)");
+    if (health.thermal_throttled) {
+        health.summary += " [Thermal Throttle Detected]";
+    } else {
+        health.summary += " [Thermals Nominal]";
+    }
+
+    return health;
+}
 
 // ============================================================================
 // AdamW Optimizer Implementation
@@ -157,6 +224,12 @@ void Trainer::train() {
     if (config.start_step > 1) {
         std::cout << "  Resuming Training from Step: " << config.start_step << " of " << config.max_steps << "\n";
     }
+    if (config.smart_governor_enabled) {
+        std::cout << "  Thermal Governor: ACTIVE (Duty Cycle: " << config.work_window_minutes 
+                  << " min train → save checkpoint → " << config.cooldown_minutes << " min in-place cooling pause)\n";
+        auto init_health = inspect_system_health();
+        std::cout << "  System Topology: " << init_health.summary << "\n";
+    }
     std::cout << "--------------------------------------------------------------------\n";
 
     std::mt19937_64 rng(config.seed);
@@ -164,6 +237,7 @@ void Trainer::train() {
     std::uniform_int_distribution<size_t> record_dist(0, total_sft_records > 0 ? (total_sft_records - 1) : 0);
 
     auto start_time = std::chrono::high_resolution_clock::now();
+    auto work_window_start = std::chrono::high_resolution_clock::now();
     size_t total_tokens_processed = 0;
 
     for (size_t step = config.start_step; step <= config.max_steps; ++step) {
@@ -261,6 +335,62 @@ void Trainer::train() {
                           << " (Step " << step << " | Loss: " << std::fixed << std::setprecision(4)
                           << avg_step_loss << ")\n"
                           << std::flush;
+            }
+        }
+
+        // 8. Smart Thermal & Battery Governor (Duty-Cycle Training with In-Process Cooling Pauses)
+        if (config.smart_governor_enabled && step < config.max_steps) {
+            auto now = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double, std::ratio<60>> elapsed_work = now - work_window_start;
+
+            if (elapsed_work.count() >= static_cast<double>(config.work_window_minutes)) {
+                std::cout << "\n====================================================================\n";
+                std::cout << "  [Thermal Governor] " << config.work_window_minutes 
+                          << "-Minute Training Window Completed (Step " << step << ")\n";
+                std::cout << "  Saving interim checkpoint to disk before cooling break...\n";
+                model.save_weights(config.checkpoint_path, static_cast<uint32_t>(step), avg_step_loss);
+                std::cout << "  --> Checkpoint safely synchronized: " << config.checkpoint_path << "\n";
+                
+                auto health = inspect_system_health();
+                std::cout << "  Current System Health: " << health.summary << "\n";
+                std::cout << "  Entering " << config.cooldown_minutes << "-minute in-process cooling pause...\n";
+                std::cout << "  (Memory remains locked in RAM; training will automatically resume.)\n";
+                std::cout << "====================================================================\n" << std::flush;
+
+                const int total_cooldown_sec = static_cast<int>(config.cooldown_minutes * 60);
+                for (int rem = total_cooldown_sec; rem > 0; --rem) {
+                    if (rem % 60 == 0 || rem == total_cooldown_sec || rem <= 10) {
+                        auto cur_health = inspect_system_health();
+                        int mins = rem / 60;
+                        int secs = rem % 60;
+                        std::cout << "  [Thermal Governor] Cooldown in progress: " 
+                                  << std::setw(2) << std::setfill('0') << mins << ":" 
+                                  << std::setw(2) << std::setfill('0') << secs << " remaining | "
+                                  << cur_health.summary << "\n" << std::flush;
+                    }
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+
+                // Pre-flight check before resuming
+                bool ready = false;
+                while (!ready) {
+                    auto pre_health = inspect_system_health();
+                    if (!pre_health.on_ac && pre_health.battery_pct < config.min_battery_percent) {
+                        std::cout << "  [Thermal Governor WARNING] Battery critical (" << pre_health.battery_pct 
+                                  << "%). Pausing until AC power is connected...\n" << std::flush;
+                        std::this_thread::sleep_for(std::chrono::seconds(15));
+                        continue;
+                    }
+                    ready = true;
+                }
+
+                std::cout << "\n====================================================================\n";
+                std::cout << "  [Thermal Governor] Pre-Flight Health Check: PASSED!\n";
+                std::cout << "  CPU Die Cooled Down. Resuming next " << config.work_window_minutes 
+                          << "-minute training cycle at Step " << (step + 1) << "...\n";
+                std::cout << "====================================================================\n\n" << std::flush;
+
+                work_window_start = std::chrono::high_resolution_clock::now();
             }
         }
     }

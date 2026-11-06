@@ -352,6 +352,7 @@ void run_phase5_trainer_and_generation_verification(const titan::Tokenizer& toke
         config.checkpoint_interval = 15;
         config.dataset_path = "titan_tokens.bin";
         config.checkpoint_path = "test_weights.bin";
+        config.smart_governor_enabled = false;
 
         titan::Trainer trainer(model, tokenizer, config);
         trainer.train();
@@ -615,6 +616,12 @@ int main(int argc, char* argv[]) {
                 config.start_step = loaded_step + 1;
             }
 
+            // Smart Thermal & Battery Duty Cycle Governor (30m work → 10m in-place cooling brake)
+            config.smart_governor_enabled = true;
+            config.work_window_minutes    = 30;   // 30 minutes of continuous training
+            config.cooldown_minutes       = 10;   // 10 minutes cooling break
+            config.min_battery_percent    = 20;   // Safe battery threshold
+
             titan::Trainer trainer(model, tokenizer, config);
             trainer.train();
             return 0;
@@ -694,6 +701,12 @@ int main(int argc, char* argv[]) {
             config.weight_decay        = 0.05f;
             config.log_interval        = 10;       // Log every 10 steps
             config.checkpoint_interval = 250;      // Regular checkpointing
+
+            // Smart Thermal & Battery Duty Cycle Governor (30m work → 10m in-place cooling brake)
+            config.smart_governor_enabled = true;
+            config.work_window_minutes    = 30;   // 30 minutes of continuous training
+            config.cooldown_minutes       = 10;   // 10 minutes cooling break
+            config.min_battery_percent    = 20;   // Safe battery threshold
 
             std::cout << "  Dataset File: " << config.dataset_path << "\n";
             std::cout << "  Checkpoint  : " << config.checkpoint_path << "\n";
