@@ -9,9 +9,64 @@
 #include <random>
 #include <stdexcept>
 #include <cassert>
+#include <filesystem>
+#include <arm_neon.h>
 #include <Accelerate/Accelerate.h>
 
 namespace titan {
+
+namespace {
+
+// ============================================================================
+// Apple Silicon ARM64 NEON Vectorized FP32 <-> FP16 Conversion Kernels
+// ============================================================================
+inline void float32_to_float16_neon(const float* src, _Float16* dst, size_t n) noexcept {
+    size_t i = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    for (; i + 16 <= n; i += 16) {
+        float32x4_t v0 = vld1q_f32(src + i);
+        float32x4_t v1 = vld1q_f32(src + i + 4);
+        float32x4_t v2 = vld1q_f32(src + i + 8);
+        float32x4_t v3 = vld1q_f32(src + i + 12);
+
+        float16x4_t h0 = vcvt_f16_f32(v0);
+        float16x4_t h1 = vcvt_f16_f32(v1);
+        float16x4_t h2 = vcvt_f16_f32(v2);
+        float16x4_t h3 = vcvt_f16_f32(v3);
+
+        vst1q_f16(reinterpret_cast<float16_t*>(dst + i), vcombine_f16(h0, h1));
+        vst1q_f16(reinterpret_cast<float16_t*>(dst + i + 8), vcombine_f16(h2, h3));
+    }
+#endif
+    for (; i < n; ++i) {
+        dst[i] = static_cast<_Float16>(src[i]);
+    }
+}
+
+inline void float16_to_float32_neon(const _Float16* src, float* dst, size_t n) noexcept {
+    size_t i = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    for (; i + 16 <= n; i += 16) {
+        float16x8_t h01 = vld1q_f16(reinterpret_cast<const float16_t*>(src + i));
+        float16x8_t h23 = vld1q_f16(reinterpret_cast<const float16_t*>(src + i + 8));
+
+        float32x4_t v0 = vcvt_f32_f16(vget_low_f16(h01));
+        float32x4_t v1 = vcvt_f32_f16(vget_high_f16(h01));
+        float32x4_t v2 = vcvt_f32_f16(vget_low_f16(h23));
+        float32x4_t v3 = vcvt_f32_f16(vget_high_f16(h23));
+
+        vst1q_f32(dst + i, v0);
+        vst1q_f32(dst + i + 4, v1);
+        vst1q_f32(dst + i + 8, v2);
+        vst1q_f32(dst + i + 12, v3);
+    }
+#endif
+    for (; i < n; ++i) {
+        dst[i] = static_cast<float>(src[i]);
+    }
+}
+
+} // anonymous namespace
 
 // ============================================================================
 // LayerNorm Implementation (Apple Silicon vDSP Vectorized)
@@ -572,22 +627,6 @@ std::vector<ParameterRef> TitanModel::get_parameters() {
     return params;
 }
 
-namespace {
-struct alignas(8) CheckpointHeader {
-    uint32_t magic{0x54495457}; // 'TITW'
-    uint32_t version{1};
-    uint64_t total_params{0};
-    uint32_t vocab_size{0};
-    uint32_t d_model{0};
-    uint32_t num_layers{0};
-    uint32_t n_heads{0};
-    uint32_t max_seq_len{0};
-    uint32_t step{0};
-    float loss{0.0f};
-    uint32_t reserved{0};
-};
-} // anonymous namespace
-
 bool TitanModel::save_weights(const std::string& filepath, uint32_t step, float loss) const {
     std::ofstream out(filepath, std::ios::binary);
     if (!out.is_open()) return false;
@@ -603,7 +642,7 @@ bool TitanModel::save_weights(const std::string& filepath, uint32_t step, float 
         .max_seq_len = static_cast<uint32_t>(max_seq_len),
         .step = step,
         .loss = loss,
-        .reserved = 0
+        .precision = 0 // FP32
     };
 
     out.write(reinterpret_cast<const char*>(&header), sizeof(header));
@@ -619,7 +658,55 @@ bool TitanModel::save_weights(const std::string& filepath, uint32_t step, float 
     return out.good();
 }
 
-bool TitanModel::load_weights(const std::string& filepath, uint32_t* out_step, float* out_loss) {
+bool TitanModel::save_weights_fp16(const std::string& filepath, uint32_t step, float loss) const {
+    std::ofstream out(filepath, std::ios::binary);
+    if (!out.is_open()) return false;
+
+    CheckpointHeader header{
+        .magic = 0x54495457,
+        .version = 2,
+        .total_params = static_cast<uint64_t>(parameter_count()),
+        .vocab_size = static_cast<uint32_t>(vocab_size),
+        .d_model = static_cast<uint32_t>(d_model),
+        .num_layers = static_cast<uint32_t>(num_layers),
+        .n_heads = static_cast<uint32_t>(n_heads),
+        .max_seq_len = static_cast<uint32_t>(max_seq_len),
+        .step = step,
+        .loss = loss,
+        .precision = 1 // FP16
+    };
+
+    out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+
+    constexpr size_t CHUNK_SIZE = 65536;
+    std::vector<_Float16> chunk(CHUNK_SIZE);
+
+    auto params = const_cast<TitanModel*>(this)->get_parameters();
+    for (const auto& p : params) {
+        const float* src = p.tensor->data.data();
+        size_t remaining = p.tensor->data.size();
+        while (remaining > 0) {
+            size_t count = std::min(remaining, CHUNK_SIZE);
+            float32_to_float16_neon(src, chunk.data(), count);
+            out.write(
+                reinterpret_cast<const char*>(chunk.data()),
+                static_cast<std::streamsize>(count * sizeof(_Float16))
+            );
+            if (!out.good()) return false;
+            src += count;
+            remaining -= count;
+        }
+    }
+
+    return out.good();
+}
+
+bool TitanModel::load_weights(
+    const std::string& filepath,
+    uint32_t* out_step,
+    float* out_loss,
+    uint32_t* out_precision
+) {
     std::ifstream in(filepath, std::ios::binary);
     if (!in.is_open()) return false;
 
@@ -627,23 +714,144 @@ bool TitanModel::load_weights(const std::string& filepath, uint32_t* out_step, f
     in.read(reinterpret_cast<char*>(&header), sizeof(header));
     if (!in.good() || header.magic != 0x54495457) return false;
 
+    // Support v1 (legacy FP32) and v2 (precision tag aware)
+    if (header.version != 1 && header.version != 2) return false;
+
     if (header.vocab_size != vocab_size || header.d_model != d_model ||
         header.num_layers != num_layers || header.n_heads != n_heads) {
         return false;
     }
 
+    uint32_t prec = (header.version == 1) ? 0 : header.precision;
+    if (prec > 1) return false; // Unsupported precision
+
     if (out_step) *out_step = header.step;
     if (out_loss) *out_loss = header.loss;
+    if (out_precision) *out_precision = prec;
 
     auto params = get_parameters();
-    for (const auto& p : params) {
-        in.read(
-            reinterpret_cast<char*>(p.tensor->data.data()),
-            static_cast<std::streamsize>(p.tensor->bytes())
-        );
-        if (!in.good()) return false;
+
+    if (prec == 0) {
+        // FP32 direct binary streaming
+        for (const auto& p : params) {
+            in.read(
+                reinterpret_cast<char*>(p.tensor->data.data()),
+                static_cast<std::streamsize>(p.tensor->bytes())
+            );
+            if (!in.good()) return false;
+        }
+    } else {
+        // FP16 half-precision streaming with ARM64 NEON decoding
+        constexpr size_t CHUNK_SIZE = 65536;
+        std::vector<_Float16> chunk(CHUNK_SIZE);
+
+        for (const auto& p : params) {
+            float* dst = p.tensor->data.data();
+            size_t remaining = p.tensor->data.size();
+            while (remaining > 0) {
+                size_t count = std::min(remaining, CHUNK_SIZE);
+                in.read(
+                    reinterpret_cast<char*>(chunk.data()),
+                    static_cast<std::streamsize>(count * sizeof(_Float16))
+                );
+                if (!in.good()) return false;
+                float16_to_float32_neon(chunk.data(), dst, count);
+                dst += count;
+                remaining -= count;
+            }
+        }
     }
 
+    return true;
+}
+
+bool TitanModel::convert_checkpoint_to_fp16(
+    const std::string& input_filepath,
+    const std::string& output_filepath
+) {
+    std::ifstream in(input_filepath, std::ios::binary);
+    if (!in.is_open()) return false;
+
+    CheckpointHeader in_header{};
+    in.read(reinterpret_cast<char*>(&in_header), sizeof(in_header));
+    if (!in.good() || in_header.magic != 0x54495457) return false;
+
+    uint32_t in_prec = (in_header.version == 1) ? 0 : in_header.precision;
+    if (in_prec == 1) {
+        if (input_filepath == output_filepath) return true;
+        in.close();
+        std::error_code ec;
+        std::filesystem::copy_file(input_filepath, output_filepath, std::filesystem::copy_options::overwrite_existing, ec);
+        return !ec;
+    }
+
+    std::string temp_out_path = output_filepath + ".tmp";
+    std::ofstream out(temp_out_path, std::ios::binary);
+    if (!out.is_open()) return false;
+
+    CheckpointHeader out_header = in_header;
+    out_header.version = 2;
+    out_header.precision = 1; // FP16
+
+    out.write(reinterpret_cast<const char*>(&out_header), sizeof(out_header));
+
+    constexpr size_t CHUNK_SIZE = 65536;
+    std::vector<float> f32_chunk(CHUNK_SIZE);
+    std::vector<_Float16> f16_chunk(CHUNK_SIZE);
+
+    uint64_t remaining = in_header.total_params;
+    while (remaining > 0) {
+        size_t count = static_cast<size_t>(std::min<uint64_t>(remaining, CHUNK_SIZE));
+        in.read(
+            reinterpret_cast<char*>(f32_chunk.data()),
+            static_cast<std::streamsize>(count * sizeof(float))
+        );
+        if (!in.good()) {
+            out.close();
+            std::error_code ec;
+            std::filesystem::remove(temp_out_path, ec);
+            return false;
+        }
+
+        float32_to_float16_neon(f32_chunk.data(), f16_chunk.data(), count);
+
+        out.write(
+            reinterpret_cast<const char*>(f16_chunk.data()),
+            static_cast<std::streamsize>(count * sizeof(_Float16))
+        );
+        if (!out.good()) {
+            out.close();
+            std::error_code ec;
+            std::filesystem::remove(temp_out_path, ec);
+            return false;
+        }
+
+        remaining -= count;
+    }
+
+    in.close();
+    out.close();
+
+    std::error_code ec;
+    std::filesystem::rename(temp_out_path, output_filepath, ec);
+    if (ec) {
+        std::filesystem::copy_file(temp_out_path, output_filepath, std::filesystem::copy_options::overwrite_existing, ec);
+        std::filesystem::remove(temp_out_path, ec);
+        return !ec;
+    }
+
+    return true;
+}
+
+bool TitanModel::read_checkpoint_header(
+    const std::string& filepath,
+    CheckpointHeader& out_header
+) {
+    std::ifstream in(filepath, std::ios::binary);
+    if (!in.is_open()) return false;
+
+    in.read(reinterpret_cast<char*>(&out_header), sizeof(out_header));
+    if (!in.good() || out_header.magic != 0x54495457) return false;
     return true;
 }
 

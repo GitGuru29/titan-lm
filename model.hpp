@@ -15,6 +15,28 @@ namespace titan {
 // Forward declarations
 class Tokenizer;
 
+// Precision format flags
+enum class ModelPrecision : uint32_t {
+    FP32 = 0,
+    FP16 = 1
+};
+
+// Checkpoint header structure (48 bytes, 8-byte aligned)
+// Fully backward compatible with legacy version 1 checkpoints.
+struct alignas(8) CheckpointHeader {
+    uint32_t magic{0x54495457}; // 'TITW'
+    uint32_t version{1};        // 1 = legacy FP32, 2 = v2 (precision-aware)
+    uint64_t total_params{0};
+    uint32_t vocab_size{0};
+    uint32_t d_model{0};
+    uint32_t num_layers{0};
+    uint32_t n_heads{0};
+    uint32_t max_seq_len{0};
+    uint32_t step{0};
+    float loss{0.0f};
+    uint32_t precision{0};      // 0 = FP32, 1 = FP16
+};
+
 // Parameter reference with weight decay flag for AdamW
 struct ParameterRef {
     Tensor* tensor{nullptr};
@@ -246,7 +268,26 @@ public:
 
     // Model checkpoint serialization
     bool save_weights(const std::string& filepath, uint32_t step = 0, float loss = 0.0f) const;
-    bool load_weights(const std::string& filepath, uint32_t* out_step = nullptr, float* out_loss = nullptr);
+    bool save_weights_fp16(const std::string& filepath, uint32_t step = 0, float loss = 0.0f) const;
+    bool load_weights(
+        const std::string& filepath,
+        uint32_t* out_step = nullptr,
+        float* out_loss = nullptr,
+        uint32_t* out_precision = nullptr
+    );
+
+    // Fast streaming checkpoint converter: converts FP32 checkpoint to FP16 checkpoint
+    // without loading full model into RAM.
+    static bool convert_checkpoint_to_fp16(
+        const std::string& input_filepath,
+        const std::string& output_filepath
+    );
+
+    // Reads checkpoint header metadata without loading model weights
+    static bool read_checkpoint_header(
+        const std::string& filepath,
+        CheckpointHeader& out_header
+    );
 
     // Autoregressive token generation with real-time stdout streaming and repetition penalty.
     // suppress_special_tokens: if true, pieces matching special token strings are silently
