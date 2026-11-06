@@ -7,7 +7,7 @@
 
 CXX         := clang++
 CXXFLAGS    := -std=c++20 -O3 -mcpu=apple-m4 -DACCELERATE_NEW_LAPACK -framework Accelerate -Wall -Wextra -Wpedantic -Wshadow -Qunused-arguments
-LDFLAGS     := -framework Accelerate -framework IOKit -framework CoreFoundation
+LDFLAGS     := -framework Accelerate -framework IOKit -framework CoreFoundation -framework CoreGraphics
 
 TARGET      := titan_lm
 SRCS        := main.cpp tokenizer.cpp tensor.cpp attention.cpp model.cpp trainer.cpp governor.cpp
