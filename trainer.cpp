@@ -161,9 +161,14 @@ void Trainer::train() {
     }
     if (config.governor.enabled) {
         auto init_tel = governor.sample();
-        std::cout << "  Smart Governor: ACTIVE (Continuous Closed-Loop Sensor Pacing & Auto-Cooldown)\n";
-        std::cout << "  Hardware Sensors: " << init_tel.sensor_count << " Apple Silicon die sensors detected\n";
-        std::cout << "  Initial State: " << std::fixed << std::setprecision(1) << init_tel.max_temp_c << "°C (Peak) | "
+        std::cout << "  Smart Governor: ACTIVE [Profile: " << config.governor.profile_name << "]\n";
+        std::cout << "  Hardware Sensors: " << init_tel.sensor_count << " Apple Silicon die sensors detected"
+                  << " | Docked Setup: " << (init_tel.is_docked ? "YES" : "NO") << "\n";
+        std::cout << "  Setpoints: Target ≤ " << std::fixed << std::setprecision(0) << config.governor.target_temp_c
+                  << "°C (Full Throttle) | Emergency > " << config.governor.emergency_temp_c
+                  << "°C | Resume ≤ " << config.governor.resume_temp_c << "°C\n";
+        std::cout << "  Initial State: " << std::fixed << std::setprecision(1) << init_tel.effective_temp_c 
+                  << "°C (Peak: " << init_tel.max_temp_c << "°C, Avg: " << init_tel.avg_temp_c << "°C) | "
                   << "Power: " << (init_tel.on_ac ? "AC Connected" : "Battery") 
                   << " (" << init_tel.battery_pct << "%" << (init_tel.is_charging ? ", Charging" : "") << ")\n";
     }
@@ -266,7 +271,7 @@ void Trainer::train() {
                       << "Speed: " << std::fixed << std::setprecision(1) << step_tokens_per_sec << " tok/s";
             if (config.governor.enabled) {
                 const auto& tel = governor.last_telemetry;
-                std::cout << " | " << std::fixed << std::setprecision(1) << tel.max_temp_c << "°C [" << tel.thermal_zone << "]";
+                std::cout << " | " << std::fixed << std::setprecision(1) << tel.effective_temp_c << "°C [" << tel.thermal_zone << "]";
                 if (tel.active_pacing_ms > 0) {
                     std::cout << " (Pace: " << tel.active_pacing_ms << "ms)";
                 }

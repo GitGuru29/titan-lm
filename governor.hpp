@@ -17,12 +17,23 @@ class TitanModel;
 struct GovernorTelemetry {
     float max_temp_c{0.0f};          // Peak die sensor temperature (°C)
     float avg_temp_c{0.0f};          // Average active die sensor temperature (°C)
+    float effective_temp_c{0.0f};    // Weighted control temperature (60% avg + 40% peak)
     int sensor_count{0};             // Number of active IOKit thermal sensors
     int battery_pct{100};            // Current battery charge (0-100)
     bool on_ac{true};                // True if drawing from AC adapter (MagSafe/USB-C)
     bool is_charging{false};         // True if battery is actively charging
-    uint32_t active_pacing_ms{0};     // Current adaptive inter-batch duty cycle delay (ms)
-    std::string thermal_zone;        // "NOMINAL", "ELEVATED", "HOT", "EMERGENCY"
+    bool is_docked{false};           // True if docked / external display detected
+    uint32_t active_pacing_ms{0};    // Current adaptive inter-batch duty cycle delay (ms)
+    std::string thermal_zone;        // "OPTIMAL", "ELEVATED", "WARM", "HOT", "EMERGENCY"
+};
+
+// ============================================================================
+// Thermal Operating Profiles
+// ============================================================================
+enum class ThermalProfile {
+    AUTO,    // Auto-detects DOCKED if external display/dock connected or on AC, else MOBILE
+    MOBILE,  // Laptop on lap: conservative setpoints (target 76°C, emergency 88°C, resume 65°C)
+    DOCKED   // Docked/Desk with cooling pad: high-performance setpoints (target 86°C, emergency 95°C, resume 78°C)
 };
 
 // ============================================================================
@@ -30,18 +41,22 @@ struct GovernorTelemetry {
 // ============================================================================
 struct GovernorConfig {
     bool enabled{true};
+    ThermalProfile profile{ThermalProfile::AUTO};
+    std::string profile_name{"AUTO"};
 
     // Continuous Closed-Loop Temperature Setpoints (°C)
-    float target_temp_c{76.0f};      // Below this: Green zone (0ms pacing, 100% full throttle)
-    float throttle_temp_c{82.0f};    // 76°C-82°C: Yellow zone (smooth 5ms-35ms adaptive micro-pacing)
-    float alert_temp_c{86.0f};       // 82°C-86°C: Orange zone (40ms-80ms cooling pacing)
-    float emergency_temp_c{88.0f};   // > 88°C: Red zone (instant checkpoint save + active sensor cooldown)
-    float resume_temp_c{65.0f};      // Dynamic cooldown floor: resumes immediately once temp <= 65°C
+    float target_temp_c{86.0f};      // Below this: Green zone (0ms pacing, 100% full throttle)
+    float throttle_temp_c{90.0f};    // Adaptive micro-pacing (5ms-35ms)
+    float alert_temp_c{93.0f};       // Steeper cooling pacing (40ms-85ms)
+    float emergency_temp_c{95.0f};   // Red zone: instant checkpoint save + sensor cooldown loop
+    float resume_temp_c{78.0f};      // Dynamic cooldown floor: resumes immediately once temp <= floor
 
     // Intelligent Battery Management
     int min_battery_percent{20};     // Safe reserve: pause if on battery and <= 20%
     bool battery_saver_on_dc{true};  // When on battery, apply 20ms eco-pacing to protect battery health
     uint32_t dc_eco_pacing_ms{20};   // Base eco-pacing delay on DC power
+
+    void apply_profile(ThermalProfile p);
 };
 
 // ============================================================================
@@ -54,6 +69,9 @@ public:
 
     HardwareGovernor(const GovernorConfig& cfg = {});
     ~HardwareGovernor();
+
+    // Hardware setup detection
+    static bool is_docked_setup();
 
     // Query hardware sensors in < 2ms without subprocess overhead
     [[nodiscard]] GovernorTelemetry sample();

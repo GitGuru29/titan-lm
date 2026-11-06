@@ -617,13 +617,16 @@ int main(int argc, char* argv[]) {
             }
 
             // Smart Closed-Loop Hardware Governor (Real-Time Apple Silicon IOKit Telemetry)
-            config.governor.enabled             = true;
-            config.governor.target_temp_c       = 76.0f;  // 100% full throttle (< 76°C)
-            config.governor.throttle_temp_c     = 82.0f;  // 5ms-35ms adaptive micro-pacing (76°C-82°C)
-            config.governor.alert_temp_c        = 86.0f;  // 40ms-85ms cooling pacing (82°C-86°C)
-            config.governor.emergency_temp_c    = 88.0f;  // Emergency checkpoint save + dynamic cooling loop (> 88°C)
-            config.governor.resume_temp_c       = 65.0f;  // Resumes immediately once sensor drops to <= 65°C
-            config.governor.min_battery_percent = 20;     // Safe battery floor on DC power
+            config.governor.enabled = true;
+            config.governor.profile = titan::ThermalProfile::AUTO;
+            for (int i = 2; i < argc; ++i) {
+                std::string arg = argv[i];
+                if (arg == "--docked") {
+                    config.governor.apply_profile(titan::ThermalProfile::DOCKED);
+                } else if (arg == "--mobile") {
+                    config.governor.apply_profile(titan::ThermalProfile::MOBILE);
+                }
+            }
 
             titan::Trainer trainer(model, tokenizer, config);
             trainer.train();
@@ -706,13 +709,16 @@ int main(int argc, char* argv[]) {
             config.checkpoint_interval = 250;      // Regular checkpointing
 
             // Smart Closed-Loop Hardware Governor (Real-Time Apple Silicon IOKit Telemetry)
-            config.governor.enabled             = true;
-            config.governor.target_temp_c       = 76.0f;  // 100% full throttle (< 76°C)
-            config.governor.throttle_temp_c     = 82.0f;  // 5ms-35ms adaptive micro-pacing (76°C-82°C)
-            config.governor.alert_temp_c        = 86.0f;  // 40ms-85ms cooling pacing (82°C-86°C)
-            config.governor.emergency_temp_c    = 88.0f;  // Emergency checkpoint save + dynamic cooling loop (> 88°C)
-            config.governor.resume_temp_c       = 65.0f;  // Resumes immediately once sensor drops to <= 65°C
-            config.governor.min_battery_percent = 20;     // Safe battery floor on DC power
+            config.governor.enabled = true;
+            config.governor.profile = titan::ThermalProfile::AUTO;
+            for (int i = 2; i < argc; ++i) {
+                std::string arg = argv[i];
+                if (arg == "--docked") {
+                    config.governor.apply_profile(titan::ThermalProfile::DOCKED);
+                } else if (arg == "--mobile") {
+                    config.governor.apply_profile(titan::ThermalProfile::MOBILE);
+                }
+            }
 
             std::cout << "  Dataset File: " << config.dataset_path << "\n";
             std::cout << "  Checkpoint  : " << config.checkpoint_path << "\n";
