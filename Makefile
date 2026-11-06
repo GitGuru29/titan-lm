@@ -7,12 +7,12 @@
 
 CXX         := clang++
 CXXFLAGS    := -std=c++20 -O3 -mcpu=apple-m4 -DACCELERATE_NEW_LAPACK -framework Accelerate -Wall -Wextra -Wpedantic -Wshadow -Qunused-arguments
-LDFLAGS     := -framework Accelerate
+LDFLAGS     := -framework Accelerate -framework IOKit -framework CoreFoundation
 
 TARGET      := titan_lm
-SRCS        := main.cpp tokenizer.cpp tensor.cpp attention.cpp model.cpp trainer.cpp
+SRCS        := main.cpp tokenizer.cpp tensor.cpp attention.cpp model.cpp trainer.cpp governor.cpp
 OBJS        := $(SRCS:.cpp=.o)
-DEPS        := tokenizer.hpp tensor.hpp attention.hpp model.hpp trainer.hpp
+DEPS        := tokenizer.hpp tensor.hpp attention.hpp model.hpp trainer.hpp governor.hpp
 
 .PHONY: all clean run benchmark test help train generate ingest
 

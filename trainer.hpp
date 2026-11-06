@@ -4,6 +4,7 @@
 
 #include "model.hpp"
 #include "tokenizer.hpp"
+#include "governor.hpp"
 #include <vector>
 #include <string>
 #include <cstddef>
@@ -34,11 +35,8 @@ struct TrainingConfig {
     bool is_sft{false};             // Supervised Fine-Tuning mode with paired (X, Y_masked) records
     size_t start_step{1};           // Starting step (for seamless checkpoint resumption)
 
-    // ── Smart Thermal & Battery Governor (Duty-Cycle Training) ─────────────
-    bool smart_governor_enabled{true};
-    size_t work_window_minutes{30};       // Continuous training duration before cooling pause (default 30m)
-    size_t cooldown_minutes{10};          // In-process cooling pause duration (default 10m)
-    int min_battery_percent{20};          // Pause if battery drops below 20% on DC
+    // ── Smart Closed-Loop Hardware Governor (Sensor-Driven Adaptive Pacing) ──
+    GovernorConfig governor;
 };
 
 // ============================================================================
@@ -90,6 +88,7 @@ public:
     const Tokenizer& tokenizer;
     TrainingConfig config;
     AdamW optimizer;
+    HardwareGovernor governor;
 
     Trainer(TitanModel& model, const Tokenizer& tokenizer, const TrainingConfig& config);
 

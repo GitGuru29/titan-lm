@@ -198,7 +198,7 @@ Measured on **Apple Silicon M4** (MacBook, 16 GB Unified Memory):
 ## Branches
 
 - **`main`**: Clean, high-throughput Titan-450M engine with base pre-training, turn-aligned SFT alignment, and conversational chat inference.
-- **`feature/thermal-governor`**: Includes the **Smart Thermal & Battery Governor**—an in-process duty-cycle manager running 30-min training / 10-min in-place cooling breaks with macOS battery and die thermal health checks.
+- **`feature/thermal-governor`**: Smart Closed-Loop Hardware Governor featuring direct Apple Silicon IOKit HID thermal sensor polling (40+ on-die sensors in < 2ms without root/sudo), continuous proportional micro-pacing, dynamic temperature-triggered emergency cooling with instant resumption as soon as die temperature drops to safe floor (≤ 65°C), and automated IOPowerSources battery reserve protection.
 
 ---
 

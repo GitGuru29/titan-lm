@@ -352,7 +352,7 @@ void run_phase5_trainer_and_generation_verification(const titan::Tokenizer& toke
         config.checkpoint_interval = 15;
         config.dataset_path = "titan_tokens.bin";
         config.checkpoint_path = "test_weights.bin";
-        config.smart_governor_enabled = false;
+        config.governor.enabled = true;
 
         titan::Trainer trainer(model, tokenizer, config);
         trainer.train();
@@ -616,11 +616,14 @@ int main(int argc, char* argv[]) {
                 config.start_step = loaded_step + 1;
             }
 
-            // Smart Thermal & Battery Duty Cycle Governor (30m work → 10m in-place cooling brake)
-            config.smart_governor_enabled = true;
-            config.work_window_minutes    = 30;   // 30 minutes of continuous training
-            config.cooldown_minutes       = 10;   // 10 minutes cooling break
-            config.min_battery_percent    = 20;   // Safe battery threshold
+            // Smart Closed-Loop Hardware Governor (Real-Time Apple Silicon IOKit Telemetry)
+            config.governor.enabled             = true;
+            config.governor.target_temp_c       = 76.0f;  // 100% full throttle (< 76°C)
+            config.governor.throttle_temp_c     = 82.0f;  // 5ms-35ms adaptive micro-pacing (76°C-82°C)
+            config.governor.alert_temp_c        = 86.0f;  // 40ms-85ms cooling pacing (82°C-86°C)
+            config.governor.emergency_temp_c    = 88.0f;  // Emergency checkpoint save + dynamic cooling loop (> 88°C)
+            config.governor.resume_temp_c       = 65.0f;  // Resumes immediately once sensor drops to <= 65°C
+            config.governor.min_battery_percent = 20;     // Safe battery floor on DC power
 
             titan::Trainer trainer(model, tokenizer, config);
             trainer.train();
@@ -702,11 +705,14 @@ int main(int argc, char* argv[]) {
             config.log_interval        = 10;       // Log every 10 steps
             config.checkpoint_interval = 250;      // Regular checkpointing
 
-            // Smart Thermal & Battery Duty Cycle Governor (30m work → 10m in-place cooling brake)
-            config.smart_governor_enabled = true;
-            config.work_window_minutes    = 30;   // 30 minutes of continuous training
-            config.cooldown_minutes       = 10;   // 10 minutes cooling break
-            config.min_battery_percent    = 20;   // Safe battery threshold
+            // Smart Closed-Loop Hardware Governor (Real-Time Apple Silicon IOKit Telemetry)
+            config.governor.enabled             = true;
+            config.governor.target_temp_c       = 76.0f;  // 100% full throttle (< 76°C)
+            config.governor.throttle_temp_c     = 82.0f;  // 5ms-35ms adaptive micro-pacing (76°C-82°C)
+            config.governor.alert_temp_c        = 86.0f;  // 40ms-85ms cooling pacing (82°C-86°C)
+            config.governor.emergency_temp_c    = 88.0f;  // Emergency checkpoint save + dynamic cooling loop (> 88°C)
+            config.governor.resume_temp_c       = 65.0f;  // Resumes immediately once sensor drops to <= 65°C
+            config.governor.min_battery_percent = 20;     // Safe battery floor on DC power
 
             std::cout << "  Dataset File: " << config.dataset_path << "\n";
             std::cout << "  Checkpoint  : " << config.checkpoint_path << "\n";
