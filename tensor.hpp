@@ -157,9 +157,13 @@ struct Tensor {
 
     // --- Loss & Optimization Utilities ---
 
+    // Canonical sentinel value for masked targets in SFT (zero loss, zero gradient)
+    static constexpr uint32_t IGNORE_INDEX = 0xFFFFFFFF;
+
     // Cross-Entropy Loss computation for language modeling
     // Given logits (B x V) and target integer tokens (B):
-    // Computes mean cross-entropy loss and accumulates gradients into grad_logits
+    // Computes mean cross-entropy loss and accumulates gradients into grad_logits.
+    // Positions with target == IGNORE_INDEX are ignored (contribute 0 loss and 0 gradient).
     static float cross_entropy_loss(
         const Tensor& logits,
         const std::vector<uint32_t>& targets,

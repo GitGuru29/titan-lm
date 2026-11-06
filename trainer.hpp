@@ -31,6 +31,14 @@ struct TrainingConfig {
     std::string checkpoint_path{"titan_weights.bin"};
     std::string dataset_path{"titan_tokens.bin"};
     uint64_t seed{1337};
+    bool is_sft{false};             // Supervised Fine-Tuning mode with paired (X, Y_masked) records
+    size_t start_step{1};           // Starting step (for seamless checkpoint resumption)
+
+    // ── Smart Thermal & Battery Governor (Duty-Cycle Training) ─────────────
+    bool smart_governor_enabled{true};
+    size_t work_window_minutes{30};       // Continuous training duration before cooling pause (default 30m)
+    size_t cooldown_minutes{10};          // In-process cooling pause duration (default 10m)
+    int min_battery_percent{20};          // Pause if battery drops below 20% on DC
 };
 
 // ============================================================================

@@ -544,7 +544,7 @@ bool TitanModel::save_weights(const std::string& filepath, uint32_t step, float 
     return out.good();
 }
 
-bool TitanModel::load_weights(const std::string& filepath) {
+bool TitanModel::load_weights(const std::string& filepath, uint32_t* out_step, float* out_loss) {
     std::ifstream in(filepath, std::ios::binary);
     if (!in.is_open()) return false;
 
@@ -556,6 +556,9 @@ bool TitanModel::load_weights(const std::string& filepath) {
         header.num_layers != num_layers || header.n_heads != n_heads) {
         return false;
     }
+
+    if (out_step) *out_step = header.step;
+    if (out_loss) *out_loss = header.loss;
 
     auto params = get_parameters();
     for (const auto& p : params) {

@@ -206,7 +206,7 @@ public:
 
     // Model checkpoint serialization
     bool save_weights(const std::string& filepath, uint32_t step = 0, float loss = 0.0f) const;
-    bool load_weights(const std::string& filepath);
+    bool load_weights(const std::string& filepath, uint32_t* out_step = nullptr, float* out_loss = nullptr);
 
     // Autoregressive token generation with real-time stdout streaming and repetition penalty.
     // suppress_special_tokens: if true, pieces matching special token strings are silently

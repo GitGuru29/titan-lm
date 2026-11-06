@@ -428,25 +428,42 @@ float Tensor::cross_entropy_loss(
     Tensor probs = forward_softmax(logits);
 
     float total_loss = 0.0f;
-    const float inv_batch = 1.0f / static_cast<float>(B);
+    size_t active_count = 0;
 
     for (size_t b = 0; b < B; ++b) {
         uint32_t target = targets[b];
+        if (target == IGNORE_INDEX) {
+            // Masked position (prompt or padding): contributes 0 loss, 0 gradient
+            continue;
+        }
         if (target >= V) {
             throw std::out_of_range("Target token ID exceeds vocabulary dimension");
         }
 
         float p = probs(b, target);
         total_loss += -std::log(std::max(p, 1e-12f));
+        active_count++;
 
-        // Softmax + Cross Entropy combined analytical gradient: (P_c - 1{c == target}) / B
+        // Un-normalized gradient accumulator: (P_c - 1{c == target})
         for (size_t c = 0; c < V; ++c) {
             float indicator = (c == target) ? 1.0f : 0.0f;
-            grad_logits.grad_at(b, c) += (probs(b, c) - indicator) * inv_batch;
+            grad_logits.grad_at(b, c) += (probs(b, c) - indicator);
         }
     }
 
-    return total_loss * inv_batch;
+    if (active_count == 0) return 0.0f;
+
+    // Normalize gradients and total loss by active unmasked tokens
+    const float inv_active = 1.0f / static_cast<float>(active_count);
+    for (size_t b = 0; b < B; ++b) {
+        if (targets[b] != IGNORE_INDEX) {
+            for (size_t c = 0; c < V; ++c) {
+                grad_logits.grad_at(b, c) *= inv_active;
+            }
+        }
+    }
+
+    return total_loss * inv_active;
 }
 
 // ============================================================================
