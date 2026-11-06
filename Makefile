@@ -36,7 +36,7 @@ test: $(TARGET)
 	./$(TARGET)
 
 train: $(TARGET)
-	@echo "==> Launching Full Titan-LM Training Loop (d_model=512, 12 layers, 10000 steps)..."
+	@echo "==> Launching Titan-450M Training Loop (d_model=1152, 28 layers, 16 heads, 13.8GB RAM)..."
 	./$(TARGET) train
 
 train-instruct: $(TARGET)

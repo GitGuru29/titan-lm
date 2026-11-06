@@ -351,14 +351,14 @@ void run_phase5_trainer_and_generation_verification(const titan::Tokenizer& toke
         config.log_interval = 5;
         config.checkpoint_interval = 15;
         config.dataset_path = "titan_tokens.bin";
-        config.checkpoint_path = "titan_weights.bin";
+        config.checkpoint_path = "test_weights.bin";
 
         titan::Trainer trainer(model, tokenizer, config);
         trainer.train();
 
         // Verify checkpoint file serialization
-        bool checkpoint_exists = std::filesystem::exists("titan_weights.bin");
-        size_t cp_size = checkpoint_exists ? std::filesystem::file_size("titan_weights.bin") : 0;
+        bool checkpoint_exists = std::filesystem::exists("test_weights.bin");
+        size_t cp_size = checkpoint_exists ? std::filesystem::file_size("test_weights.bin") : 0;
 
         if (checkpoint_exists && cp_size > 0) {
             std::cout << "  Model Checkpoint Serialization: PASSED (" << cp_size << " bytes on disk)\n\n";
@@ -551,62 +551,69 @@ int main(int argc, char* argv[]) {
 
         if (command == "train") {
             const size_t vocab_size = tokenizer.vocab_size();
-            // ── Phase 6: 50M-parameter scaled architecture ──────────────────
-            //   d_model=512 → head_dim=64 (crisp, standard)
-            //   12 layers   → deep residual stack
-            //   max_seq=256 → double the attention memory window
-            //   ~50M parameters total on 16 GB unified memory
-            const size_t d_model    = 512;
-            const size_t num_layers = 12;
-            const size_t n_heads    = 8;   // head_dim = 512/8 = 64 ✓
+            // ── Titan-450M Scaled Architecture (Targeting 13.8 GB Unified RAM on Apple Silicon M4) ──
+            //   d_model=1152 → head_dim = 1152 / 16 = 72
+            //   num_layers=28 → 28 deep residual transformer blocks
+            //   n_heads=16   → 16 multi-head attention streams
+            //   max_seq=256  → full 256-token attention window
+            //   batch_size=6 → 6 micro-batch accumulation (1,536 tokens/step)
+            //   Total params: 456,060,672 (456.06M)
+            //   FP32 (Weights + Gradients + AdamW m + AdamW v) = 7.30 GB
+            //   Activation cache + scratch buffers = ~2.2 GB
+            //   Target working set = ~9.5 GB dirty RAM, total resident + page cache = ~13.8 GB
+            const size_t d_model    = 1152;
+            const size_t num_layers = 28;
+            const size_t n_heads    = 16;   // head_dim = 1152/16 = 72 ✓
             const size_t max_seq    = 256;
 
-            // Estimated parameter count:
-            //   Embedding:         vocab * d_model           = ~397K
-            //   Per layer (attn):  4 * d_model^2             = ~1.05M
-            //   Per layer (ffn):   2 * d_model * 4*d_model   = ~2.10M
-            //   Per layer (ln):    4 * d_model               = ~2K
-            //   12 layers total:   12 * ~3.15M               = ~37.8M
-            //   Total:                                        ≈ 50M params
-
-            std::cout << "\n[train] Phase 6 Scaled Model Config:\n";
+            std::cout << "\n[train] Titan-450M Scaled Architecture (Apple Silicon M4 Native):\n";
             std::cout << "  vocab_size  = " << vocab_size  << "\n";
             std::cout << "  d_model     = " << d_model     << "\n";
             std::cout << "  num_layers  = " << num_layers  << "\n";
             std::cout << "  n_heads     = " << n_heads     << "  → head_dim = " << (d_model/n_heads) << "\n";
             std::cout << "  max_seq     = " << max_seq     << "\n";
             std::cout << "  est. params ≈ " << std::fixed << std::setprecision(2)
-                      << (vocab_size * d_model * 2 + num_layers * (4 * d_model * d_model + 2 * d_model * 4 * d_model + 4 * d_model)) / 1000000.0 << "M\n\n";
+                      << (vocab_size * d_model * 2 + max_seq * d_model + num_layers * (4 * d_model * d_model + 4 * d_model + 2 * d_model * 4 * d_model + 5 * d_model + 4 * d_model) + 2 * d_model) / 1000000.0 << "M\n\n";
 
             titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
 
             // Safeguard & continuous pre-training on expanded corpus
             const std::string base_weights = "titan_weights.bin";
             const std::string backup_prev  = "titan_weights.prev.bin";
+            uint32_t loaded_step = 0;
+            float loaded_loss = 0.0f;
+            bool checkpoint_loaded = false;
+
             if (std::filesystem::exists(base_weights)) {
                 std::error_code ec;
                 std::filesystem::copy_file(base_weights, backup_prev, std::filesystem::copy_options::overwrite_existing, ec);
                 if (!ec) {
                     std::cout << "  [Checkpoint Safety] Existing weights archived → " << backup_prev << "\n";
                 }
-                if (model.load_weights(base_weights)) {
-                    std::cout << "  [Continuous Pre-training] Successfully loaded existing weights from " << base_weights << "\n";
+                if (model.load_weights(base_weights, &loaded_step, &loaded_loss)) {
+                    checkpoint_loaded = true;
+                    std::cout << "  [Continuous Pre-training] Successfully loaded existing weights from " << base_weights 
+                              << " (Step " << loaded_step << " | Loss: " << std::fixed << std::setprecision(4) << loaded_loss << ")\n";
                 } else {
-                    std::cout << "  [WARNING] Could not parse existing checkpoint. Starting fresh initialization.\n";
+                    std::cout << "  [Fresh Initialization] Architecture changed to Titan-450M (456.06M params). Starting Xavier initialization.\n";
                 }
             } else {
-                std::cout << "  [INFO] No existing weights found. Starting random initialization.\n";
+                std::cout << "  [INFO] No existing weights found. Starting Xavier initialization.\n";
             }
 
             titan::TrainingConfig config;
-            config.batch_size          = 4;       // micro-batch size
-            config.seq_len             = 128;     // half of max_seq (safe sliding window)
+            config.batch_size          = 6;       // 6 micro-batch gradient accumulation (1,536 tokens/step)
+            config.seq_len             = 256;     // 256 tokens context window
             config.max_steps           = 10000;   // 10K optimization steps
             config.warmup_steps        = 500;     // linear warmup
-            config.learning_rate       = 2e-4f;   // stable rate for continuous pre-training
-            config.min_learning_rate   = 2e-5f;   // cosine decay floor
-            config.log_interval        = 50;      // telemetry interval
-            config.checkpoint_interval = 500;     // checkpoint save interval
+            config.learning_rate       = 1.5e-4f; // stable AdamW learning rate for 450M model
+            config.min_learning_rate   = 1.5e-5f; // cosine decay floor
+            config.log_interval        = 10;      // telemetry interval
+            config.checkpoint_interval = 250;     // checkpoint save interval
+
+            if (checkpoint_loaded && loaded_step > 0 && loaded_step < config.max_steps) {
+                config.start_step = loaded_step + 1;
+            }
 
             titan::Trainer trainer(model, tokenizer, config);
             trainer.train();
@@ -616,21 +623,22 @@ int main(int argc, char* argv[]) {
         if (command == "stream-instruct" && argc >= 3) {
             std::filesystem::path input_file = argv[2];
             std::filesystem::path output_bin = (argc >= 4) ? argv[3] : "titan_instruct_tokens.bin";
-            tokenizer.stream_tokenize_chat_file(input_file, output_bin);
+            size_t seq_len = (argc >= 5) ? static_cast<size_t>(std::stoul(argv[4])) : 192;
+            tokenizer.stream_tokenize_chat_file(input_file, output_bin, seq_len);
             return 0;
         }
 
         if (command == "train_instruct" || command == "train-instruct") {
             const size_t vocab_size = tokenizer.vocab_size();
-            const size_t d_model    = 512;
-            const size_t num_layers = 12;
-            const size_t n_heads    = 8;
+            const size_t d_model    = 1152;
+            const size_t num_layers = 28;
+            const size_t n_heads    = 16;
             const size_t max_seq    = 256;
 
             std::cout << "  ====================================================================\n";
-            std::cout << "  TITAN-LM Phase 10: Deep Conversational Alignment (10K Steps)\n";
+            std::cout << "  TITAN-LM 450M SFT Alignment: Turn-Aligned Supervised Fine-Tuning\n";
             std::cout << "  ====================================================================\n";
-            std::cout << "  Model Config: 42.15M params (d_model=512, 12 layers, 8 heads, max_seq=256)\n";
+            std::cout << "  Model Config: 456.06M params (d_model=1152, 28 layers, 16 heads, max_seq=256)\n";
             std::cout << "  Active Vocab: " << vocab_size << " BPE tokens\n";
 
             titan::TitanModel model(vocab_size, d_model, num_layers, n_heads, max_seq);
@@ -653,8 +661,11 @@ int main(int argc, char* argv[]) {
                 }
 
                 // Load base weights into model for instruction alignment transfer learning
-                if (model.load_weights(base_weights)) {
-                    std::cout << "  [Transfer Learning] Successfully loaded base weights from " << base_weights << "\n";
+                uint32_t loaded_base_step = 0;
+                float loaded_base_loss = 0.0f;
+                if (model.load_weights(base_weights, &loaded_base_step, &loaded_base_loss)) {
+                    std::cout << "  [Transfer Learning] Successfully loaded base weights from " << base_weights 
+                              << " (Base Step " << loaded_base_step << " | Loss: " << std::fixed << std::setprecision(4) << loaded_base_loss << ")\n";
                 } else {
                     std::cout << "  [WARNING] Could not parse base weights. Initializing fresh parameters.\n";
                 }
@@ -662,7 +673,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "  [INFO] No base weights found at " << base_weights << ". Starting with random initialization.\n";
             }
 
-            // 2. Conversational Training Configuration — Phase 10: 10K Deep Alignment Run
+            // 2. Conversational Training Configuration — Turn-Aligned SFT Mode
             const std::string instruct_dataset = "titan_instruct_tokens.bin";
             if (!std::filesystem::exists(instruct_dataset)) {
                 std::cerr << "\n[ERROR] Conversational dataset not found: " << instruct_dataset << "\n";
@@ -673,15 +684,16 @@ int main(int argc, char* argv[]) {
             titan::TrainingConfig config;
             config.dataset_path        = instruct_dataset;
             config.checkpoint_path     = instruct_weights;
-            config.batch_size          = 6;        // Larger batches → smoother gradients
-            config.seq_len             = 192;      // Longer context covers full dialogue turns
-            config.max_steps           = 10000;   // 10× longer: ~1.86 epochs over CodeAlpaca-20k
-            config.warmup_steps        = 400;     // Longer warmup for stability over 10K steps
-            config.learning_rate       = 5e-5f;   // Lower peak LR to prevent catastrophic forgetting
-            config.min_learning_rate   = 5e-6f;   // Smooth cosine annealing floor
+            config.is_sft              = true;     // Turn-aligned SFT with target loss masking
+            config.batch_size          = 6;        // 6 dialogues per micro-batch
+            config.seq_len             = 192;      // Fixed sequence length for aligned dialogue turns
+            config.max_steps           = 5000;     // 5000 focused SFT steps
+            config.warmup_steps        = 250;      // Warmup
+            config.learning_rate       = 1e-4f;    // Targeted peak LR for response adaptation
+            config.min_learning_rate   = 1e-5f;    // Cosine floor
             config.weight_decay        = 0.05f;
-            config.log_interval        = 50;      // Log every 50 steps
-            config.checkpoint_interval = 500;     // Save checkpoint every 500 steps
+            config.log_interval        = 10;       // Log every 10 steps
+            config.checkpoint_interval = 250;      // Regular checkpointing
 
             std::cout << "  Dataset File: " << config.dataset_path << "\n";
             std::cout << "  Checkpoint  : " << config.checkpoint_path << "\n";
@@ -699,7 +711,7 @@ int main(int argc, char* argv[]) {
             titan::Trainer trainer(model, tokenizer, config);
             trainer.train();
 
-            std::cout << "\n[train_instruct] Phase 10 Deep Alignment complete! Checkpoint saved → " << instruct_weights << "\n";
+            std::cout << "\n[train_instruct] Titan-450M Alignment complete! Checkpoint saved → " << instruct_weights << "\n";
             return 0;
         }
 
@@ -707,9 +719,9 @@ int main(int argc, char* argv[]) {
             std::string prompt = argv[2];
             // ── Must match the architecture saved in titan_weights.bin ──────
             const size_t vocab_size = tokenizer.vocab_size();
-            const size_t d_model    = 512;   // Phase 6: 50M model
-            const size_t num_layers = 12;
-            const size_t n_heads    = 8;
+            const size_t d_model    = 1152;   // Titan-450M
+            const size_t num_layers = 28;
+            const size_t n_heads    = 16;
             const size_t max_seq    = 256;
 
             // Optional args: ./titan_lm generate "prompt" [tokens] [temp] [rep_penalty]
@@ -746,9 +758,9 @@ int main(int argc, char* argv[]) {
         if (command == "chat" && argc >= 3) {
             std::string user_instruction = argv[2];
             const size_t vocab_size = tokenizer.vocab_size();
-            const size_t d_model    = 512;
-            const size_t num_layers = 12;
-            const size_t n_heads    = 8;
+            const size_t d_model    = 1152;
+            const size_t num_layers = 28;
+            const size_t n_heads    = 16;
             const size_t max_seq    = 256;
 
             size_t gen_tokens          = 256;

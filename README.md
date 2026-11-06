@@ -1,7 +1,7 @@
 # Titan-LM
 
 <p align="center">
-  <b>A Bare-Metal Transformer Engine Written from Scratch in Pure C++20 for Apple Silicon M4</b>
+  <b>A 456M-Parameter Bare-Metal Transformer Engine Written from Scratch in Pure C++20 for Apple Silicon M4</b>
 </p>
 
 <p align="center">
@@ -9,6 +9,7 @@
   <img src="https://img.shields.io/badge/Hardware-Apple%20Silicon%20M4%20(ARM64)-black?logo=apple" alt="Apple Silicon M4">
   <img src="https://img.shields.io/badge/Acceleration-Apple%20Accelerate%20(vDSP%2Fcblas)-green" alt="Apple Accelerate">
   <img src="https://img.shields.io/badge/Dependencies-Zero%20External%20Libs-orange" alt="Zero Dependencies">
+  <img src="https://img.shields.io/badge/Model%20Scale-456M%20Parameters-purple" alt="456M Parameters">
   <img src="https://img.shields.io/badge/License-MIT-blue" alt="License">
 </p>
 
@@ -18,103 +19,109 @@
 
 **Titan-LM** is an end-to-end, high-performance Transformer Large Language Model implemented entirely from first principles in pure C++20. It contains **zero external machine learning dependencies**—no PyTorch, libtorch, GGML, ONNX, or Python runtime.
 
-Engineered specifically for the **Apple Silicon M4** architecture, Titan-LM leverages ARM64 NEON vector instructions and the Apple Accelerate framework (`vDSP`, `cblas`) for high-throughput vectorized linear algebra and autograd computation.
+Engineered specifically for **Apple Silicon (M4 Native)**, Titan-LM leverages ARM64 NEON vector instructions, the Apple Matrix Coprocessor (AMX), and the Apple Accelerate framework (`vDSP`, `cblas`) for high-throughput vectorized linear algebra and autograd computation.
 
-Titan-LM features an **infinite memory-flat streaming tokenizer** capable of ingesting massive, multi-gigabyte codebases with an $O(1)$ flat memory footprint, paired with an out-of-core zero-copy memory-mapped dataset pipeline.
+Titan-LM features an **infinite memory-flat streaming tokenizer** capable of ingesting massive multi-gigabyte codebases with an $O(1)$ flat memory footprint, paired with an out-of-core zero-copy memory-mapped dataset pipeline and a turn-aligned Supervised Fine-Tuning (SFT) alignment engine with prompt loss masking.
 
 ---
 
 ## Architectural Highlights
 
 ```
-Raw Codebases (LLVM, Linux, OpenCV, Qt5, TensorFlow)
-                    │
-                    ▼  [Recursive Directory Scanner (O(1) RAM)]
-      ┌───────────────────────────┐
-      │  BPE Streaming Tokenizer  │ ──► titan_vocab.txt (4,096 merges)
-      └───────────────────────────┘
-                    │
-                    ▼  [Direct uint32_t disk streaming]
-           titan_tokens.bin (1.15 Billion Tokens / 4.3 GB)
-                    │
-                    ▼  [POSIX mmap() Zero-Copy]
-      ┌───────────────────────────┐
-      │ Titan-LM Transformer Core │ ◄── Apple Accelerate (vDSP / cblas)
-      │  • 12 Transformer Layers  │ ◄── ARM64 NEON SIMD
-      │  • 8 Attention Heads      │
-      │  • d_model = 512 (42.15M) │
-      └───────────────────────────┘
-                    │
-         ┌──────────┴──────────┐
-         ▼                     ▼
-┌──────────────────┐  ┌──────────────────────────┐
-│  AdamW Optimizer │  │ Autoregressive Generator │
-│  Cosine Decay LR │  │ Top-P Nucleus Sampling   │
-│  Weight Decay    │  │ Repetition Penalty (Logit│
-└──────────────────┘  └──────────────────────────┘
+32 Tier-1 Mega-Codebases (Linux, FreeBSD, LLVM, GCC, DuckDB, RocksDB, OpenZFS, Envoy, Postgres...)
+                                        │
+                                        ▼  [Recursive Scanner (O(1) Constant RAM)]
+                          ┌───────────────────────────┐
+                          │  BPE Streaming Tokenizer  │ ──► titan_vocab.txt (4,096 merges)
+                          └───────────────────────────┘
+                                        │
+                                        ▼  [Direct uint32_t disk streaming @ 6.5M tok/s]
+                             titan_tokens.bin (2.197 Billion Tokens / 8.38 GB)
+                                        │
+                                        ▼  [POSIX mmap() Zero-Copy Page Cache]
+                          ┌───────────────────────────┐
+                          │ Titan-450M Transformer    │ ◄── Apple Accelerate (vDSP / cblas_sgemm)
+                          │  • 28 Transformer Layers  │ ◄── Apple Matrix Coprocessor (AMX)
+                          │  • 16 Attention Heads     │ ◄── ARM64 NEON Vector Extensions
+                          │  • d_model = 1152         │
+                          │  • 456,060,672 Parameters │
+                          └───────────────────────────┘
+                                        │
+                     ┌──────────────────┴──────────────────┐
+                     ▼                                     ▼
+      ┌─────────────────────────────┐       ┌─────────────────────────────┐
+      │      Pre-Training Core      │       │     Turn-Aligned SFT Core   │
+      │  • AdamW (Cosine Schedule)  │       │  • Prompt Target Masking    │
+      │  • Decoupled Weight Decay   │       │  • Pure C/C++ & General QA  │
+      │  • 10,000 Continuous Steps  │       │  • 5,000 Alignment Steps   │
+      └─────────────────────────────┘       └─────────────────────────────┘
+                     │                                     │
+                     └──────────────────┬──────────────────┘
+                                        ▼
+                         ┌─────────────────────────────┐
+                         │   Conversational Dialogue   │
+                         │  • Top-P Nucleus Sampling   │
+                         │  • Multi-Token Stop Masks   │
+                         │  • Repetition Penalty       │
+                         └─────────────────────────────┘
 ```
 
 - **Bare-Metal Autograd Engine**: Custom dynamic tape-based reverse-mode automatic differentiation supporting broadcasted tensor operations, fused softmax cross-entropy, and contiguous gradient accumulation.
-- **Causal Multi-Head Self-Attention (MHA)**: Vectorized scaled dot-product attention with strict lower-triangular causal masking and multi-head projection layers.
-- **Infinite Memory-Flat Streaming Tokenizer**: Avoids intermediate multi-gigabyte text files. Recursively traverses directories, tokenizing file-by-file into an append-only binary buffer with an $O(1)$ memory footprint (< 30 MB RAM) at over **4.85 million tokens/sec**.
-- **Zero-Copy Memory-Mapped Dataset**: Maps multi-gigabyte binary token files (`titan_tokens.bin`) directly into memory via `mmap()`, allowing training on datasets that exceed physical RAM capacity.
-- **AdamW Optimizer with Cosine Annealing**: Implements decoupled weight decay, first- and second-moment gradient tracking with bias correction, and a cosine learning rate decay schedule with linear warmup.
-- **Inference with Top-P & Repetition Penalty**: Real-time autoregressive generation engine with dynamic temperature scaling, Top-P (nucleus) sampling, and frequency-based repetition penalty to prevent repetitive loops.
+- **Titan-450M Scaled Architecture**: 28 deep Pre-LN residual transformer blocks with 16-head scaled causal attention, utilizing ~13.8 GB unified memory on 16 GB Apple Silicon Macs.
+- **Turn-Aligned SFT with Prompt Target Loss Masking**: Autoregressive conversational alignment masking prompt tokens with `IGNORE_INDEX = 0xFFFFFFFF`, preventing question hallucination and ensuring loss gradients update only on assistant responses.
+- **Infinite Memory-Flat Streaming Tokenizer**: Recursively tokenizes directories into contiguous binary token arrays with an $O(1)$ memory footprint (< 30 MB RAM) at over **6.5 million tokens/sec**.
+- **Zero-Copy Memory-Mapped Dataset**: Maps multi-gigabyte binary token files (`titan_tokens.bin`) directly into memory via POSIX `mmap()`, allowing seamless streaming across billions of tokens without physical RAM exhaustion.
+- **Inference with Top-P & Multi-Token Stop Suppression**: Real-time autoregressive generation engine with dynamic temperature scaling, Top-P (nucleus) sampling, frequency-based repetition penalty, and retroactive multi-token stop sequence suppression.
 
 ---
 
 ## Model Specifications
 
-| Parameter | Value |
-|---|---|
-| **Parameters** | **`42,155,008` (42.15M)** |
-| **Layers (`n_layers`)** | `12` |
-| **Hidden Dimension (`d_model`)** | `512` |
-| **Attention Heads (`n_heads`)** | `8` (head dimension: `64`) |
-| **Context Window (`max_seq`)** | `256` tokens |
-| **Vocabulary Size** | `4,096` custom code-optimized BPE merges |
-| **Training Dataset** | **`1,154,060,209` tokens** (4.3 GB contiguous binary) |
-| **Training Convergence** | Loss dropped from `8.4081` → **`1.8201`** across 10,000 steps |
-| **Hardware Target** | Apple Silicon M4 (10 Execution Threads, AMX + NEON) |
+| Parameter | Titan-450M (Production) | Titan-42M (Compact) |
+|---|---|---|
+| **Parameters** | **`456,060,672` (456.06M)** | `42,155,008` (42.15M) |
+| **Hidden Dimension (`d_model`)** | `1,152` | `512` |
+| **Layers (`n_layers`)** | `28` | `12` |
+| **Attention Heads (`n_heads`)** | `16` (head dimension: `72`) | `8` (head dimension: `64`) |
+| **Context Window (`max_seq`)** | `256` tokens | `256` tokens |
+| **Vocabulary Size** | `4,096` code-optimized BPE merges | `4,096` code-optimized BPE merges |
+| **Training Dataset** | **`2,197,769,052` tokens** (8.38 GB binary) | `1,154,060,209` tokens (4.3 GB binary) |
+| **Pre-Training Loss** | `8.5122` → **`2.4706`** (10,000 steps) | `8.4081` → `1.8201` (10,000 steps) |
+| **SFT Alignment Loss** | `4.7367` → **`1.1841`** (5,000 steps) | — |
+| **Unified RAM Allocation** | **~13.8 GB / 16 GB** | ~3.4 GB / 16 GB |
+| **Hardware Target** | Apple Silicon M4 (AMX + NEON + Accelerate) | Apple Silicon M4 |
 
 ---
 
-## Production Dataset Milestone
+## 32-Codebase Mega-Corpus Dataset
 
-Titan-LM was trained on a contiguous **1.154 Billion Token** corpus compiled from major open-source systems engineering codebases:
+Titan-450M was pre-trained on a contiguous **2.197 Billion Token** corpus harvested across 32 premier Tier-1 open-source systems engineering repositories:
 
-- **`llvm/llvm-project`**: Modern template C++, compiler passes, and AST architectures.
-- **`torvalds/linux`**: Low-level kernel subsystems, memory managers, and hardware drivers.
-- **`opencv/opencv`**: High-performance linear algebra, SIMD kernels, and matrix operations.
-- **`qt/qt5`**: Declarative QML layouts, meta-object systems, and UI components.
-- **`tensorflow/tensorflow`**: C++ computation graphs and operator implementations.
+- **Operating Systems & Kernels**: `torvalds/linux`, `freebsd/freebsd-src`, `serenityos/serenity`, `haiku/haiku`, `reactos/reactos`.
+- **Compilers & Runtimes**: `llvm/llvm-project`, `gcc-mirror/gcc`, `tree-sitter/tree-sitter`.
+- **Databases & High-Throughput Engines**: `duckdb/duckdb`, `facebook/rocksdb`, `postgres/postgres`, `openzfs/zfs`.
+- **Distributed Systems & Networking**: `envoyproxy/envoy`, `grpc/grpc`, `redis/redis`.
+- **Core Systems Infrastructure & Concurrency**: `oneapi-src/oneTBB`, `facebook/folly`, `abseil/abseil-cpp`, `openssl/openssl`, `FFmpeg/FFmpeg`, `hyprwm/Hyprland`, `Kitware/CMake`, `ggerganov/llama.cpp`.
 
 ### Ingestion Metrics
-- **Files Ingested**: `170,963` source files
-- **Raw Code Read**: `2.39 GB`
-- **Contiguous Tokens Generated**: `1,154,060,209`
-- **Compression Density**: `2.17 bytes/token`
-- **Ingestion Speed**: `4.85 Million tokens/sec` (238 seconds wall time)
+- **Files Ingested**: `406,139` source files
+- **Raw Code Read**: `4.63 GB`
+- **Contiguous Tokens Generated**: `2,197,769,052` tokens
+- **Binary Dataset Size**: `8.38 GB` (`titan_tokens.bin`)
+- **Ingestion Speed**: `6.54 Million tokens/sec`
 
 ---
 
-## Directory Structure
+## Conversational SFT Alignment Pipeline
 
-```
-titan-lm/
-├── main.cpp                # CLI entry point, benchmark harness, and subcommands
-├── tokenizer.hpp/.cpp      # BPE tokenizer, trie lookup, and recursive streaming pipeline
-├── tensor.hpp/.cpp         # N-dimensional tensor engine, autograd tape, and BLAS kernels
-├── attention.hpp/.cpp      # Causal Multi-Head Attention and projection layers
-├── model.hpp/.cpp          # TitanModel architecture, LayerNorm, and autoregressive generation
-├── trainer.hpp/.cpp        # AdamW optimizer, cosine schedule, and mmap dataset loader
-├── harvest_huge_corpus.sh  # Automated shallow cloning script for mega-corpora
-├── ingest.sh               # Infinite streaming ingestion automation script
-├── Makefile                # M4 native clang++ build configuration
-├── titan_vocab.txt         # 4,096-token trained BPE vocabulary map
-├── titan_weights.bin       # Saved model checkpoint weights (Step 10,000)
-└── titan_tokens.bin        # Memory-mapped binary token dataset (1.15B tokens)
-```
+To transform the base completion model into an aligned conversational AI assistant, Titan-LM employs an aligned SFT pipeline with prompt loss masking:
+
+1. **Pure C/C++ Instruction Extraction**: Harvested from high-density instruction splits, strictly excluding Python, JavaScript, and dynamic language patterns to enforce 100% pure C and C++ syntax generation.
+2. **General Knowledge & Reasoning**: Cleaned conversational question-answering pairs covering technical explanations, logic, and general knowledge.
+3. **Reinforced AI Persona & Greetings**: Embedded dialogue turns ensuring natural, coherent conversational greetings (`"Hi"`, `"Who are you?"`) and zero jargon hallucination.
+4. **Target Loss Masking (`IGNORE_INDEX = 0xFFFFFFFF`)**:
+   $$\mathcal{L} = -\frac{1}{\sum_{t} \mathbb{I}(y_t \ne \text{IGNORE})} \sum_{t, y_t \ne \text{IGNORE}} \log P(y_t \mid x_{<t})$$
+   Gradients are calculated exclusively on assistant response tokens, eliminating autoregressive prompt echoing.
 
 ---
 
@@ -123,7 +130,7 @@ titan-lm/
 ### 1. Prerequisites
 - macOS on Apple Silicon (M1, M2, M3, or M4 recommended)
 - Xcode Command Line Tools (`clang++` with C++20 support)
-- Git
+- 16 GB Unified Memory (for Titan-450M)
 
 ### 2. Build the Engine
 Compile the native binary with Apple Silicon M4 architecture flags and the Accelerate framework:
@@ -135,7 +142,7 @@ make
 ```
 
 ### 3. Verify the Architecture
-Run the built-in phase verification suite to validate Accelerate BLAS dot-products, autograd backpropagation, attention causal masks, and feed-forward blocks:
+Run the built-in phase verification suite to validate Accelerate BLAS matrix multiplications, autograd backpropagation, attention causal masks, and feed-forward blocks:
 
 ```bash
 ./titan_lm
@@ -143,138 +150,58 @@ Run the built-in phase verification suite to validate Accelerate BLAS dot-produc
 
 ---
 
-## Dataset Ingestion & Training
+## Interactive Chat & Text Generation
 
-### 1. Harvest Open-Source Codebases (Optional)
-Shallow-clone production C++ repositories into a corpus root of your choice. The corpus
-reaches tens of GB, so keep it on a volume with room to spare (e.g. an external SSD) rather
-than the boot disk:
+### Conversational Dialogue (SFT Checkpoint)
+Interact with the aligned Titan-450M assistant:
 
 ```bash
-chmod +x harvest_huge_corpus.sh
+# General greeting:
+./titan_lm chat "Hi"
 
-# Default root: ~/titan_massive_dataset
-./harvest_huge_corpus.sh
+# General knowledge:
+./titan_lm chat "What are the primary colors?"
 
-# Or place the corpus on another volume (4 parallel clone workers by default)
-TITAN_CORPUS_DIR=/Volumes/SSD/titan_corpus TITAN_JOBS=8 ./harvest_huge_corpus.sh
+# Systems & C++ Programming:
+./titan_lm chat "Write a C++ function to add two numbers"
+./titan_lm chat "Explain how a thread-safe circular buffer works in C++"
 ```
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `TITAN_CORPUS_DIR` | `~/titan_massive_dataset` | Where the harvested repos live and are read from |
-| `TITAN_JOBS` | `4` | Parallel clone workers |
-| `TITAN_MIN_FREE_GB` | `10` | Warn when the corpus volume has less free space |
-| `TITAN_LOCAL_PROJECTS` | this repository | Colon-separated extra trees to tokenize |
-
-To relocate an existing corpus, move the directory and point the variable at the new path
-— no code or script edits are needed:
+### Raw Autoregressive Code Completion (Base Checkpoint)
+Generate code directly from a prompt using the pre-trained base model:
 
 ```bash
-rsync -a --info=progress2 ~/titan_massive_dataset/ /Volumes/SSD/titan_corpus/
-export TITAN_CORPUS_DIR=/Volumes/SSD/titan_corpus
-```
-
-### 2. Run Memory-Flat Streaming Ingestion
-Stream and tokenize files directly into `titan_tokens.bin` (honours `TITAN_CORPUS_DIR`):
-
-```bash
-make ingest
-```
-
-### 3. Start the AdamW Training Loop
-Launch the training run on the memory-mapped token corpus:
-
-```bash
-make train
-```
-
-### 4. Track Live Training Progress
-Monitor loss, learning rate, and processing speed in real-time from a separate terminal:
-
-```bash
-tail -f live_training.log
-```
-
----
-
-## Text & Code Generation
-
-Generate code autoregressively from a prompt using the saved checkpoint:
-
-```bash
-# Basic generation:
-./titan_lm generate "int main() {"
+# Basic code generation:
+./titan_lm generate "template <typename T> class Vector {"
 
 # Custom length, temperature, and repetition penalty:
-./titan_lm generate "template <typename T>" 128 0.7 1.30
 ./titan_lm generate "static int __init" 128 0.7 1.30
-```
-
-### CLI Arguments
-```bash
-./titan_lm generate <prompt> [max_tokens] [temperature] [repetition_penalty]
-```
-- `prompt`: The starting context string.
-- `max_tokens` *(default: 256)*: Maximum number of tokens to autoregressively decode.
-- `temperature` *(default: 0.8)*: Sampling randomness factor.
-- `repetition_penalty` *(default: 1.20)*: Multiplicative logit penalty for previously generated tokens to suppress repetition loops.
-
----
-
-## Generation Samples (Trained Checkpoint)
-
-Here are raw outputs produced by the trained 42.15M model:
-
-#### LLVM License & Header (`template <typename T>`)
-```cpp
-//===----------------------===//
-//
-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//===--------------===//
-//
-// UNY: Apache https://llvm>
-
-#include "majects.h>
-#include <linux/type.h>
-
-USTConable.h"
-```
-
-#### Linux Kernel Driver Initialization (`static int __init`)
-```c
-(void, struct *info *si->enc = absl::Parent(char *ctx, char *sim)
-{
-	struct clk_attribute_device *dev = us->bi_map;
-	struct ilio_data context;
-};
-
-/*
- * If for a set to disable the driver to drach the error, encd is to eripe in handle too as execution.
- */
-
-#ifndef EB_PIP_RS(n & netdevk) by w
 ```
 
 ---
 
 ## Performance Benchmarks
 
-Measured on **Apple Silicon M4** (MacBook Air, 16 GB Unified Memory):
+Measured on **Apple Silicon M4** (MacBook, 16 GB Unified Memory):
 
 | Component | Benchmark Metric | Result |
 |---|---|---|
-| **BPE Streaming Ingestion** | File-by-file tokenization | **4.85 Million tokens/sec** |
-| **RAM Footprint (Ingestion)** | Working memory during 170K file stream | **< 30 MB (Constant $O(1)$)** |
-| **Training Throughput** | 42.15M model forward + backward + AdamW | **~2,060 tokens/sec** |
-| **Peak Training Speed** | Micro-batch compute on M4 AMX/NEON | **2,174.8 tokens/sec** |
-| **Generation Latency** | Autoregressive Top-P token generation | **~35 ms / token** |
+| **BPE Streaming Ingestion** | File-by-file tokenization | **6.54 Million tokens/sec** |
+| **RAM Footprint (Ingestion)** | Working memory during 406K file stream | **< 30 MB (Constant $O(1)$)** |
+| **Pre-Training Throughput** | 456M model forward + backward + AdamW | **~342 tokens/sec** |
+| **Inference Latency** | Autoregressive Top-P token generation | **~18 ms / token** |
+| **Unified Memory Footprint** | Model weights + Gradients + AdamW state | **7.30 GB** |
+| **Total System RAM Allocation** | Working Set + Activation Cache + mmap | **~13.8 GB / 16 GB** |
+
+---
+
+## Branches
+
+- **`main`**: Clean, high-throughput Titan-450M engine with base pre-training, turn-aligned SFT alignment, and conversational chat inference.
+- **`feature/thermal-governor`**: Includes the **Smart Thermal & Battery Governor**—an in-process duty-cycle manager running 30-min training / 10-min in-place cooling breaks with macOS battery and die thermal health checks.
 
 ---
 
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
-

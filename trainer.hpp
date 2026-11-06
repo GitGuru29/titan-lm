@@ -31,6 +31,8 @@ struct TrainingConfig {
     std::string checkpoint_path{"titan_weights.bin"};
     std::string dataset_path{"titan_tokens.bin"};
     uint64_t seed{1337};
+    bool is_sft{false};             // Supervised Fine-Tuning mode with paired (X, Y_masked) records
+    size_t start_step{1};           // Starting step (for seamless checkpoint resumption)
 };
 
 // ============================================================================

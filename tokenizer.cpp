@@ -714,7 +714,8 @@ std::string extract_json_field_value(std::string_view json, std::string_view key
 
 IngestionStats Tokenizer::stream_tokenize_chat_file(
     const std::filesystem::path& input_path,
-    const std::filesystem::path& output_bin
+    const std::filesystem::path& output_bin,
+    size_t seq_len
 ) const {
     IngestionStats stats{};
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -742,17 +743,17 @@ IngestionStats Tokenizer::stream_tokenize_chat_file(
     out.write(reinterpret_cast<const char*>(&placeholder_header), sizeof(placeholder_header));
 
     std::cout << "\n====================================================================\n";
-    std::cout << "  TITAN-LM Conversational Streaming Tokenizer (Phase 9 Instruction Tuning)\n";
+    std::cout << "  TITAN-LM SFT Paired Streaming Tokenizer (Turn-Aligned & Masked)\n";
     std::cout << "====================================================================\n";
     std::cout << "  Input File    : " << input_path << "\n";
     std::cout << "  Target Binary : " << output_bin << "\n";
-    std::cout << "  Target Format : <|user|>\\n{instruction}\\n<|assistant|>\\n{output}<|end_of_text|>\n";
+    std::cout << "  Record Format : Turn-Aligned [X (len=" << seq_len << "), Y_target (masked prompt)]\n";
     std::cout << "  RAM Strategy  : Flat constant memory O(1) buffer\n";
     std::cout << "--------------------------------------------------------------------\n";
 
     std::string line;
-    std::string dialogue;
-    std::vector<TokenId> token_buffer;
+    std::vector<uint32_t> X(seq_len, PAD_TOKEN_ID);
+    std::vector<uint32_t> Y(seq_len, 0xFFFFFFFF); // 0xFFFFFFFF = IGNORE_INDEX
     size_t total_tokens = 0;
     size_t total_bytes = 0;
     size_t pair_count = 0;
@@ -782,25 +783,55 @@ IngestionStats Tokenizer::stream_tokenize_chat_file(
 
         if (instruction.empty() || output.empty()) continue;
 
-        // Force strict conversational dialogue template
-        dialogue.clear();
-        dialogue += "<|user|>\n";
-        dialogue += instruction;
-        dialogue += "\n<|assistant|>\n";
-        dialogue += output;
-        dialogue += "<|end_of_text|>";
+        // 1. Separate Prompt and Response strings
+        std::string prompt_str = "<|user|>\n" + instruction + "\n<|assistant|>\n";
+        std::string resp_str = output + "<|end_of_text|>";
 
-        // Encode dynamically with active 4,096 BPE vocabulary
-        token_buffer.clear();
-        encode_into(dialogue, token_buffer, false, false);
+        std::vector<TokenId> prompt_tokens = encode(prompt_str, false, false);
+        std::vector<TokenId> resp_tokens = encode(resp_str, false, false);
 
-        // Stream raw uint32_t indices directly to disk in append mode
-        if (!token_buffer.empty()) {
-            out.write(reinterpret_cast<const char*>(token_buffer.data()),
-                      token_buffer.size() * sizeof(TokenId));
-            total_tokens += token_buffer.size();
-            pair_count++;
+        if (prompt_tokens.empty() || resp_tokens.empty()) continue;
+
+        // Combine into full sequence
+        std::vector<uint32_t> full_seq = prompt_tokens;
+        full_seq.insert(full_seq.end(), resp_tokens.begin(), resp_tokens.end());
+
+        // Skip dialogues whose prompt alone exceeds sequence length
+        if (prompt_tokens.size() >= seq_len) continue;
+
+        if (full_seq.size() > seq_len) {
+            full_seq.resize(seq_len);
         }
+
+        // Initialize X with PAD, Y with IGNORE_INDEX (0xFFFFFFFF)
+        std::fill(X.begin(), X.end(), PAD_TOKEN_ID);
+        std::fill(Y.begin(), Y.end(), 0xFFFFFFFF);
+
+        for (size_t i = 0; i < full_seq.size(); ++i) {
+            X[i] = full_seq[i];
+        }
+
+        // Causal next-token prediction targets with prompt loss masking:
+        // Position i in X predicts full_seq[i + 1].
+        // Assistant response starts at index prompt_tokens.size().
+        // Position (prompt_tokens.size() - 1) predicts the first assistant token!
+        const size_t prompt_last_idx = (prompt_tokens.size() > 0) ? (prompt_tokens.size() - 1) : 0;
+        for (size_t i = 0; i + 1 < full_seq.size(); ++i) {
+            if (i >= prompt_last_idx) {
+                // Inside assistant response turn: COMPUTE LOSS!
+                Y[i] = full_seq[i + 1];
+            } else {
+                // Inside user prompt turn: MASK LOSS!
+                Y[i] = 0xFFFFFFFF;
+            }
+        }
+
+        // Write paired record [X (seq_len), Y (seq_len)] directly to disk
+        out.write(reinterpret_cast<const char*>(X.data()), seq_len * sizeof(uint32_t));
+        out.write(reinterpret_cast<const char*>(Y.data()), seq_len * sizeof(uint32_t));
+
+        total_tokens += 2 * seq_len;
+        pair_count++;
 
         if (pair_count % 2500 == 0) {
             auto now = std::chrono::high_resolution_clock::now();

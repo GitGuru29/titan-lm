@@ -139,22 +139,34 @@ void Trainer::train() {
     }
 
     const size_t num_tokens = dataset.size();
-    const size_t max_sample_offset = num_tokens - (config.seq_len + 1);
+    const size_t record_stride = 2 * config.seq_len;
+    const size_t total_sft_records = (record_stride > 0) ? (num_tokens / record_stride) : 0;
+    const size_t max_sample_offset = (num_tokens > config.seq_len + 1) ? (num_tokens - (config.seq_len + 1)) : 0;
 
     std::cout << "  Dataset File: " << config.dataset_path << " (" << num_tokens << " mapped tokens)\n";
+    if (config.is_sft) {
+        std::cout << "  Training Mode: Supervised Fine-Tuning (SFT) with Target Loss Masking\n";
+        std::cout << "  Aligned Records: " << total_sft_records << " complete dialogue turns (len=" << config.seq_len << ")\n";
+    } else {
+        std::cout << "  Training Mode: Autoregressive Next-Token Pre-Training\n";
+    }
     std::cout << "  Model Parameters: " << model.parameter_count() << " parameters\n";
     std::cout << "  Context Length: " << config.seq_len << " tokens | Micro-Batch: " << config.batch_size << "\n";
     std::cout << "  Optimization Steps: " << config.max_steps << " | Warmup: " << config.warmup_steps << " steps\n";
     std::cout << "  Peak LR: " << config.learning_rate << " | Min LR: " << config.min_learning_rate << "\n";
+    if (config.start_step > 1) {
+        std::cout << "  Resuming Training from Step: " << config.start_step << " of " << config.max_steps << "\n";
+    }
     std::cout << "--------------------------------------------------------------------\n";
 
     std::mt19937_64 rng(config.seed);
     std::uniform_int_distribution<size_t> offset_dist(0, max_sample_offset);
+    std::uniform_int_distribution<size_t> record_dist(0, total_sft_records > 0 ? (total_sft_records - 1) : 0);
 
     auto start_time = std::chrono::high_resolution_clock::now();
     size_t total_tokens_processed = 0;
 
-    for (size_t step = 1; step <= config.max_steps; ++step) {
+    for (size_t step = config.start_step; step <= config.max_steps; ++step) {
         auto step_start = std::chrono::high_resolution_clock::now();
 
         // 2. Set cosine-decayed scheduled learning rate
@@ -168,17 +180,36 @@ void Trainer::train() {
 
         // 4. Gradient Accumulation Loop across Micro-Batches
         for (size_t b = 0; b < config.batch_size; ++b) {
-            const size_t offset = offset_dist(rng);
+            std::vector<uint32_t> X_tokens;
+            std::vector<uint32_t> Y_targets;
 
-            // Zero-copy slice tokens for inputs X and targets Y (next-token prediction)
-            std::vector<uint32_t> X_tokens(
-                dataset.data_ptr() + offset,
-                dataset.data_ptr() + offset + config.seq_len
-            );
-            std::vector<uint32_t> Y_targets(
-                dataset.data_ptr() + offset + 1,
-                dataset.data_ptr() + offset + 1 + config.seq_len
-            );
+            if (config.is_sft && total_sft_records > 0) {
+                // SFT Mode: Sample a complete, turn-aligned conversation record
+                const size_t rec_idx = record_dist(rng);
+                const size_t rec_offset = rec_idx * record_stride;
+
+                X_tokens.assign(
+                    dataset.data_ptr() + rec_offset,
+                    dataset.data_ptr() + rec_offset + config.seq_len
+                );
+                // Y_targets has prompt & padding tokens masked with IGNORE_INDEX
+                Y_targets.assign(
+                    dataset.data_ptr() + rec_offset + config.seq_len,
+                    dataset.data_ptr() + rec_offset + record_stride
+                );
+            } else {
+                // Pre-training Mode: Continuous next-token prediction stream
+                const size_t offset = offset_dist(rng);
+
+                X_tokens.assign(
+                    dataset.data_ptr() + offset,
+                    dataset.data_ptr() + offset + config.seq_len
+                );
+                Y_targets.assign(
+                    dataset.data_ptr() + offset + 1,
+                    dataset.data_ptr() + offset + 1 + config.seq_len
+                );
+            }
 
             // Forward Pass
             Tensor logits = model.forward(X_tokens);
