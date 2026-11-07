@@ -184,14 +184,20 @@ struct ModelKVCache {
     std::vector<KVCache> layers;
     size_t max_seq_len{0};
     size_t d_model{0};
+    size_t n_heads{0};
 
-    void init(size_t num_layers, size_t max_seq, size_t dim) {
+    void init(size_t num_layers, size_t max_seq, size_t dim, size_t heads = 0) {
         max_seq_len = max_seq;
         d_model = dim;
+        n_heads = heads;
+        size_t head_dim = (heads > 0) ? (dim / heads) : dim;
         layers.resize(num_layers);
         for (auto& l : layers) {
-            l.k = Tensor(max_seq, dim, 0.0f);
-            l.v = Tensor(max_seq, dim, 0.0f);
+            l.n_heads = heads;
+            l.head_dim = head_dim;
+            l.max_seq_len = max_seq;
+            l.k = Tensor(heads > 0 ? (heads * max_seq) : max_seq, head_dim, 0.0f);
+            l.v = Tensor(heads > 0 ? (heads * max_seq) : max_seq, head_dim, 0.0f);
             l.length = 0;
         }
     }

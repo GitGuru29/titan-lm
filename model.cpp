@@ -488,8 +488,8 @@ Tensor TitanModel::forward_prefill(const std::vector<uint32_t>& tokens) {
         throw std::invalid_argument("Prefill token count (" + std::to_string(T) + ") exceeds max_seq_len");
     }
 
-    if (kv_cache.layers.empty() || kv_cache.max_seq_len != max_seq_len || kv_cache.d_model != d_model) {
-        kv_cache.init(num_layers, max_seq_len, d_model);
+    if (kv_cache.layers.empty() || kv_cache.max_seq_len != max_seq_len || kv_cache.d_model != d_model || kv_cache.n_heads != n_heads) {
+        kv_cache.init(num_layers, max_seq_len, d_model, n_heads);
     }
     kv_cache.clear();
 
@@ -907,6 +907,11 @@ std::string TitanModel::generate(
     Tensor decode_logits;
     const float* next_logits = prompt_logits.data_ptr() + (curr_pos - 1) * vocab_size;
 
+    // Preallocated buffers for zero-allocation sampling
+    std::vector<float> probs_buf(vocab_size);
+    std::vector<size_t> idx_buf(vocab_size);
+    std::vector<float> temp_scaled(vocab_size);
+
     for (size_t step = 0; step < max_new_tokens; ++step) {
         if (step > 0) {
             if (curr_pos >= max_seq_len) break; // Context window limit reached
@@ -949,46 +954,50 @@ std::string TitanModel::generate(
                 if (adjusted_logits[c] > best) { best = adjusted_logits[c]; next_token = static_cast<TokenId>(c); }
             }
         } else {
-            // ── Step 1: temperature-scale logits ─────────────────────────
-            std::vector<float> probs(vocab_size);
-            float max_val = *std::max_element(adjusted_logits.begin(), adjusted_logits.end());
+            // ── Step 1: temperature-scale logits using Apple Accelerate SIMD ──
+            float max_val = 0.0f;
+            vDSP_maxv(adjusted_logits.data(), 1, &max_val, vocab_size);
+            float inv_temp = 1.0f / temperature;
+            float neg_scaled_max = -max_val * inv_temp;
+            vDSP_vsmsa(adjusted_logits.data(), 1, &inv_temp, &neg_scaled_max, temp_scaled.data(), 1, vocab_size);
+
+            int n_i = static_cast<int>(vocab_size);
+            vvexpf(probs_buf.data(), temp_scaled.data(), &n_i);
+
             float sum_exp = 0.0f;
-            for (size_t c = 0; c < vocab_size; ++c) {
-                probs[c] = std::exp((adjusted_logits[c] - max_val) / temperature);
-                sum_exp += probs[c];
-            }
+            vDSP_sve(probs_buf.data(), 1, &sum_exp, vocab_size);
             float inv_sum = 1.0f / (sum_exp > 0.0f ? sum_exp : 1e-12f);
-            for (size_t c = 0; c < vocab_size; ++c) probs[c] *= inv_sum;
+            vDSP_vsmul(probs_buf.data(), 1, &inv_sum, probs_buf.data(), 1, vocab_size);
 
             // ── Step 2: build sorted index by probability descending ──────
-            std::vector<size_t> idx(vocab_size);
-            std::iota(idx.begin(), idx.end(), 0);
-            std::partial_sort(idx.begin(), idx.end(), idx.end(),
-                [&probs](size_t a, size_t b){ return probs[a] > probs[b]; });
+            std::iota(idx_buf.begin(), idx_buf.end(), 0);
+            constexpr size_t TOP_K = 64; // 64 candidates easily satisfy TOP_P = 0.90 nucleus
+            size_t sort_count = std::min(TOP_K, vocab_size);
+            std::partial_sort(idx_buf.begin(), idx_buf.begin() + sort_count, idx_buf.end(),
+                [&probs_buf](size_t a, size_t b){ return probs_buf[a] > probs_buf[b]; });
 
             // ── Step 3: nucleus truncation — keep tokens until Σp ≥ TOP_P ─
             float cum = 0.0f;
-            size_t nucleus_end = vocab_size;
-            for (size_t i = 0; i < vocab_size; ++i) {
-                cum += probs[idx[i]];
+            size_t nucleus_end = sort_count;
+            for (size_t i = 0; i < sort_count; ++i) {
+                cum += probs_buf[idx_buf[i]];
                 if (cum >= TOP_P) { nucleus_end = i + 1; break; }
             }
-            // Always keep at least 1 token
             if (nucleus_end == 0) nucleus_end = 1;
 
             // ── Step 4: re-normalise within the nucleus ───────────────────
             float nucleus_sum = 0.0f;
-            for (size_t i = 0; i < nucleus_end; ++i) nucleus_sum += probs[idx[i]];
+            for (size_t i = 0; i < nucleus_end; ++i) nucleus_sum += probs_buf[idx_buf[i]];
             float inv_nsum = 1.0f / (nucleus_sum > 0.0f ? nucleus_sum : 1e-12f);
 
             // ── Step 5: sample from the nucleus CDF ──────────────────────
             float r = dist(rng);
             float cum_p = 0.0f;
-            next_token = static_cast<TokenId>(idx[0]); // fallback = top-1
+            next_token = static_cast<TokenId>(idx_buf[0]); // fallback = top-1
             for (size_t i = 0; i < nucleus_end; ++i) {
-                cum_p += probs[idx[i]] * inv_nsum;
+                cum_p += probs_buf[idx_buf[i]] * inv_nsum;
                 if (r <= cum_p) {
-                    next_token = static_cast<TokenId>(idx[i]);
+                    next_token = static_cast<TokenId>(idx_buf[i]);
                     break;
                 }
             }
