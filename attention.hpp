@@ -29,11 +29,17 @@ struct AttentionCache {
 
 // ============================================================================
 // Autoregressive Key-Value Cache (O(1) Step Decoding)
+// Head-Partitioned Layout: (n_heads * max_seq_len * head_dim)
+// Each head h has a contiguous (max_seq_len x head_dim) buffer enabling
+// single-call Accelerate BLAS cblas_sgemv matrix-vector operations.
 // ============================================================================
 struct KVCache {
-    Tensor k;          // Key cache buffer (max_seq_len x d_model)
-    Tensor v;          // Value cache buffer (max_seq_len x d_model)
+    Tensor k;          // Key cache buffer (n_heads * max_seq_len * head_dim)
+    Tensor v;          // Value cache buffer (n_heads * max_seq_len * head_dim)
     size_t length{0};  // Current number of cached token states
+    size_t n_heads{0};
+    size_t head_dim{0};
+    size_t max_seq_len{0};
 
     void clear() noexcept { length = 0; }
     [[nodiscard]] bool empty() const noexcept { return length == 0; }
