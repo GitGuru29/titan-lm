@@ -394,15 +394,47 @@ Tensor CausalAttention::forward_decode(const Tensor& X_single, KVCache& kv_cache
         throw std::invalid_argument("pos exceeds max_seq_len in forward_decode");
     }
 
-    // 1. Single Token Projections
-    Tensor q_proj = Tensor::matmul(X_single, W_q);
-    Tensor q = Tensor::add_bias(q_proj, b_q);
+    // 1. Parallel Single Token Linear Projections: Q, K, V via GCD
+    Tensor q(1, d_model);
+    Tensor k(1, d_model);
+    Tensor v(1, d_model);
 
-    Tensor k_proj = Tensor::matmul(X_single, W_k);
-    Tensor k = Tensor::add_bias(k_proj, b_k);
+    float* q_dest = q.data_ptr();
+    float* k_dest = k.data_ptr();
+    float* v_dest = v.data_ptr();
+    const float* x_src = X_single.data_ptr();
+    const float* wq_src = W_q.data_ptr();
+    const float* wk_src = W_k.data_ptr();
+    const float* wv_src = W_v.data_ptr();
+    const float* bq_src = b_q.data_ptr();
+    const float* bk_src = b_k.data_ptr();
+    const float* bv_src = b_v.data_ptr();
 
-    Tensor v_proj = Tensor::matmul(X_single, W_v);
-    Tensor v = Tensor::add_bias(v_proj, b_v);
+    dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    dispatch_apply(3, queue, ^(size_t idx) {
+        if (idx == 0) {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        1, static_cast<int>(d_model), static_cast<int>(d_model),
+                        1.0f, x_src, static_cast<int>(d_model),
+                        wq_src, static_cast<int>(d_model),
+                        0.0f, q_dest, static_cast<int>(d_model));
+            vDSP_vadd(q_dest, 1, bq_src, 1, q_dest, 1, d_model);
+        } else if (idx == 1) {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        1, static_cast<int>(d_model), static_cast<int>(d_model),
+                        1.0f, x_src, static_cast<int>(d_model),
+                        wk_src, static_cast<int>(d_model),
+                        0.0f, k_dest, static_cast<int>(d_model));
+            vDSP_vadd(k_dest, 1, bk_src, 1, k_dest, 1, d_model);
+        } else {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        1, static_cast<int>(d_model), static_cast<int>(d_model),
+                        1.0f, x_src, static_cast<int>(d_model),
+                        wv_src, static_cast<int>(d_model),
+                        0.0f, v_dest, static_cast<int>(d_model));
+            vDSP_vadd(v_dest, 1, bv_src, 1, v_dest, 1, d_model);
+        }
+    });
 
     // 2. Append new k, v token slices into head-major contiguous cache
     const size_t head_stride = max_seq_len * head_dim;
@@ -424,7 +456,6 @@ Tensor CausalAttention::forward_decode(const Tensor& X_single, KVCache& kv_cache
     const float* q_ptr = q.data_ptr();
 
     // 3. Multi-head decode attention using parallel GCD & Accelerate BLAS GEMV
-    dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
     dispatch_apply(n_heads, queue, ^(size_t h) {
         std::vector<float> scores(total_len);
         std::vector<float> weights(total_len);
@@ -467,9 +498,17 @@ Tensor CausalAttention::forward_decode(const Tensor& X_single, KVCache& kv_cache
         );
     });
 
-    // 4. Output Projection: Y = concat_heads x W_o + b_o
-    Tensor out_proj = Tensor::matmul(concat_heads, W_o);
-    return Tensor::add_bias(out_proj, b_o);
+    // 4. Output Projection: Y = concat_heads x W_o + b_o (zero temporary allocations)
+    Tensor Y(1, d_model);
+    cblas_sgemm(
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        1, static_cast<int>(d_model), static_cast<int>(d_model),
+        1.0f, concat_ptr, static_cast<int>(d_model),
+        W_o.data_ptr(), static_cast<int>(d_model),
+        0.0f, Y.data_ptr(), static_cast<int>(d_model)
+    );
+    vDSP_vadd(Y.data_ptr(), 1, b_o.data_ptr(), 1, Y.data_ptr(), 1, d_model);
+    return Y;
 }
 
 void CausalAttention::backward(const Tensor& grad_output, Tensor& grad_X) {
@@ -751,18 +790,71 @@ Tensor FeedForward::forward(const Tensor& X) {
         );
     }
 
+    const size_t T = X.rows;
     cache.X = X;
 
-    // 1. Layer 1: H1 = X x W_1 + b_1
-    Tensor H1_proj = Tensor::matmul(X, W_1);
-    cache.H1 = Tensor::add_bias(H1_proj, b_1);
+    // 1. Layer 1: H1 = X x W_1 + b_1 (direct allocation, no intermediate matmul copy)
+    cache.H1 = Tensor(T, d_ff);
+    cblas_sgemm(
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        static_cast<int>(T), static_cast<int>(d_ff), static_cast<int>(d_model),
+        1.0f, X.data_ptr(), static_cast<int>(d_model),
+        W_1.data_ptr(), static_cast<int>(d_ff),
+        0.0f, cache.H1.data_ptr(), static_cast<int>(d_ff)
+    );
+    for (size_t r = 0; r < T; ++r) {
+        vDSP_vadd(cache.H1.data_ptr() + r * d_ff, 1, b_1.data_ptr(), 1, cache.H1.data_ptr() + r * d_ff, 1, d_ff);
+    }
 
     // 2. Intermediate ReLU Activation: H_act = max(0, H1)
     cache.H_act = Tensor::forward_relu(cache.H1);
 
-    // 3. Layer 2: Y = H_act x W_2 + b_2
-    Tensor H2_proj = Tensor::matmul(cache.H_act, W_2);
-    return Tensor::add_bias(H2_proj, b_2);
+    // 3. Layer 2: Y = H_act x W_2 + b_2 (direct allocation into result)
+    Tensor Y(T, d_model);
+    cblas_sgemm(
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        static_cast<int>(T), static_cast<int>(d_model), static_cast<int>(d_ff),
+        1.0f, cache.H_act.data_ptr(), static_cast<int>(d_ff),
+        W_2.data_ptr(), static_cast<int>(d_model),
+        0.0f, Y.data_ptr(), static_cast<int>(d_model)
+    );
+    for (size_t r = 0; r < T; ++r) {
+        vDSP_vadd(Y.data_ptr() + r * d_model, 1, b_2.data_ptr(), 1, Y.data_ptr() + r * d_model, 1, d_model);
+    }
+    return Y;
+}
+
+Tensor FeedForward::forward_decode(const Tensor& X_single) {
+    if (X_single.rows != 1 || X_single.cols != d_model) {
+        throw std::invalid_argument("X_single must be 1 x d_model in FeedForward::forward_decode");
+    }
+
+    // 1. Layer 1: H1 = X x W_1 + b_1 (1 x d_ff)
+    Tensor H_act(1, d_ff);
+    cblas_sgemm(
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        1, static_cast<int>(d_ff), static_cast<int>(d_model),
+        1.0f, X_single.data_ptr(), static_cast<int>(d_model),
+        W_1.data_ptr(), static_cast<int>(d_ff),
+        0.0f, H_act.data_ptr(), static_cast<int>(d_ff)
+    );
+    vDSP_vadd(H_act.data_ptr(), 1, b_1.data_ptr(), 1, H_act.data_ptr(), 1, d_ff);
+
+    // 2. In-place vectorized SIMD ReLU using Apple Accelerate
+    const float zero = 0.0f;
+    vDSP_vthres(H_act.data_ptr(), 1, &zero, H_act.data_ptr(), 1, d_ff);
+
+    // 3. Layer 2: Y = H_act x W_2 + b_2 (1 x d_model)
+    Tensor Y(1, d_model);
+    cblas_sgemm(
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        1, static_cast<int>(d_model), static_cast<int>(d_ff),
+        1.0f, H_act.data_ptr(), static_cast<int>(d_ff),
+        W_2.data_ptr(), static_cast<int>(d_model),
+        0.0f, Y.data_ptr(), static_cast<int>(d_model)
+    );
+    vDSP_vadd(Y.data_ptr(), 1, b_2.data_ptr(), 1, Y.data_ptr(), 1, d_model);
+    return Y;
 }
 
 void FeedForward::backward(const Tensor& grad_output, Tensor& grad_X) {

@@ -159,6 +159,9 @@ public:
     // Forward pass: Y = W_2 x ReLU(W_1 x X + b_1) + b_2
     [[nodiscard]] Tensor forward(const Tensor& X);
 
+    // Fast decode pass (no autograd caching, in-place SIMD ReLU, zero heap temporaries)
+    [[nodiscard]] Tensor forward_decode(const Tensor& X_single);
+
     // Backward pass: computes analytical gradients through Layer 2, ReLU, and Layer 1
     void backward(const Tensor& grad_output, Tensor& grad_X);
 

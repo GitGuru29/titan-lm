@@ -151,6 +151,35 @@ Tensor LayerNorm::forward(const Tensor& X) {
     return Y;
 }
 
+Tensor LayerNorm::forward_decode(const Tensor& X_single) const {
+    if (X_single.rows != 1 || X_single.cols != d_model) {
+        throw std::invalid_argument("X_single shape mismatch in LayerNorm::forward_decode");
+    }
+
+    Tensor Y(1, d_model);
+    const float* x_ptr = X_single.data_ptr();
+    float* y_ptr = Y.data_ptr();
+    const float* gamma_ptr = gamma.data_ptr();
+    const float* beta_ptr = beta.data_ptr();
+
+    float sum = 0.0f;
+    vDSP_sve(x_ptr, 1, &sum, d_model);
+    float mean = sum / static_cast<float>(d_model);
+
+    float neg_mean = -mean;
+    vDSP_vsadd(x_ptr, 1, &neg_mean, y_ptr, 1, d_model);
+
+    float sq_sum = 0.0f;
+    vDSP_dotpr(y_ptr, 1, y_ptr, 1, &sq_sum, d_model);
+    float var = sq_sum / static_cast<float>(d_model);
+    float rstd = 1.0f / std::sqrt(var + eps);
+
+    vDSP_vsmul(y_ptr, 1, &rstd, y_ptr, 1, d_model);
+    vDSP_vmul(y_ptr, 1, gamma_ptr, 1, y_ptr, 1, d_model);
+    vDSP_vadd(y_ptr, 1, beta_ptr, 1, y_ptr, 1, d_model);
+    return Y;
+}
+
 void LayerNorm::backward(const Tensor& grad_output, Tensor& grad_X) {
     const size_t T = cache.X.rows;
     if (grad_output.rows != T || grad_output.cols != d_model) {
@@ -308,12 +337,18 @@ Tensor TransformerBlock::forward_prefill(const Tensor& X, KVCache& kv_cache) {
 }
 
 Tensor TransformerBlock::forward_decode(const Tensor& X_single, KVCache& kv_cache, size_t pos) {
-    Tensor X_norm1 = ln_1.forward(X_single);
+    Tensor X_norm1 = ln_1.forward_decode(X_single);
     Tensor X_attn  = attn.forward_decode(X_norm1, kv_cache, pos);
-    Tensor X_mid   = Tensor::add(X_single, X_attn);
-    Tensor X_norm2 = ln_2.forward(X_mid);
-    Tensor X_ffn   = ffn.forward(X_norm2);
-    return Tensor::add(X_mid, X_ffn);
+
+    // In-place residual addition: X_attn += X_single (reuses X_attn buffer directly)
+    vDSP_vadd(X_attn.data_ptr(), 1, X_single.data_ptr(), 1, X_attn.data_ptr(), 1, d_model);
+
+    Tensor X_norm2 = ln_2.forward_decode(X_attn);
+    Tensor X_ffn   = ffn.forward_decode(X_norm2);
+
+    // In-place residual addition: X_ffn += X_attn (reuses X_ffn buffer directly)
+    vDSP_vadd(X_ffn.data_ptr(), 1, X_attn.data_ptr(), 1, X_ffn.data_ptr(), 1, d_model);
+    return X_ffn;
 }
 
 void TransformerBlock::backward(const Tensor& grad_output, Tensor& grad_X) {
@@ -533,9 +568,17 @@ Tensor TitanModel::forward_decode(uint32_t token, size_t pos) {
         H = layers[l].forward_decode(H, kv_cache.layers[l], pos);
     }
 
-    // 3. Final Layer Normalization & LM Head
-    Tensor H_norm = final_ln.forward(H);
-    return Tensor::matmul(H_norm, lm_head);
+    // 3. Final Layer Normalization & Direct LM Head Projection
+    Tensor H_norm = final_ln.forward_decode(H);
+    Tensor logits(1, vocab_size);
+    cblas_sgemm(
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        1, static_cast<int>(vocab_size), static_cast<int>(d_model),
+        1.0f, H_norm.data_ptr(), static_cast<int>(d_model),
+        lm_head.data_ptr(), static_cast<int>(vocab_size),
+        0.0f, logits.data_ptr(), static_cast<int>(vocab_size)
+    );
+    return logits;
 }
 
 void TitanModel::backward(const Tensor& grad_logits) {
@@ -911,6 +954,9 @@ std::string TitanModel::generate(
     std::vector<float> probs_buf(vocab_size);
     std::vector<size_t> idx_buf(vocab_size);
     std::vector<float> temp_scaled(vocab_size);
+    std::vector<float> adjusted_logits(vocab_size);
+    std::unordered_map<TokenId, size_t> token_counts;
+    token_counts.reserve(64);
 
     for (size_t step = 0; step < max_new_tokens; ++step) {
         if (step > 0) {
@@ -924,11 +970,11 @@ std::string TitanModel::generate(
         // ── Repetition & Frequency Penalty (Move 1) ───────────────────────
         // Active sequence tracking log: count frequencies over sliding window
         // to depress repeating token probability and kill looping degenerate states.
-        std::vector<float> adjusted_logits(next_logits, next_logits + vocab_size);
+        std::memcpy(adjusted_logits.data(), next_logits, vocab_size * sizeof(float));
 
         constexpr size_t PENALTY_WINDOW = 64;
         size_t window_start = (tokens.size() > PENALTY_WINDOW) ? (tokens.size() - PENALTY_WINDOW) : 0;
-        std::unordered_map<TokenId, size_t> token_counts;
+        token_counts.clear();
         for (size_t i = window_start; i < tokens.size(); ++i) {
             token_counts[tokens[i]]++;
         }

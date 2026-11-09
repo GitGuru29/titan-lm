@@ -311,14 +311,8 @@ void Tensor::backward_add_bias(const Tensor& grad_Y, Tensor& grad_X, Tensor& gra
 
 Tensor Tensor::forward_relu(const Tensor& input) {
     Tensor Y(input.rows, input.cols);
-    const size_t n = input.size();
-    const float* src = input.data.data();
-    float* dst = Y.data.data();
-
-    // Apple Silicon Neon vectorizes this loop cleanly to fmax instructions
-    for (size_t i = 0; i < n; ++i) {
-        dst[i] = (src[i] > 0.0f) ? src[i] : 0.0f;
-    }
+    const float zero = 0.0f;
+    vDSP_vthres(input.data.data(), 1, &zero, Y.data.data(), 1, input.size());
     return Y;
 }
 
