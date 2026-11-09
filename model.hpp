@@ -85,6 +85,9 @@ public:
     // and applies gain (gamma) and bias (beta) using vectorized Apple Accelerate vDSP
     [[nodiscard]] Tensor forward(const Tensor& X);
 
+    // Fast decode pass (no autograd caching, zero temporary vectors, in-place SIMD normalization)
+    [[nodiscard]] Tensor forward_decode(const Tensor& X_single) const;
+
     // Backward pass: calculates exact analytical derivatives for gamma, beta,
     // and the input tensor without loops by leveraging Apple Accelerate vDSP
     void backward(const Tensor& grad_output, Tensor& grad_X);
