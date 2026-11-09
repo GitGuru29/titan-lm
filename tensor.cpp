@@ -345,6 +345,7 @@ void Tensor::backward_relu(const Tensor& grad_output) {
 
 Tensor Tensor::forward_softmax(const Tensor& input) {
     Tensor Y(input.rows, input.cols);
+    int n_cols = static_cast<int>(input.cols);
 
     for (size_t r = 0; r < input.rows; ++r) {
         const float* x_row = input.data.data() + r * input.cols;
@@ -354,10 +355,10 @@ Tensor Tensor::forward_softmax(const Tensor& input) {
         float max_val = 0.0f;
         vDSP_maxv(x_row, 1, &max_val, input.cols);
 
-        // Exponentiate
-        for (size_t c = 0; c < input.cols; ++c) {
-            y_row[c] = std::exp(x_row[c] - max_val);
-        }
+        // Vectorized subtract max and exponentiate with Accelerate SIMD
+        float neg_max = -max_val;
+        vDSP_vsadd(x_row, 1, &neg_max, y_row, 1, input.cols);
+        vvexpf(y_row, y_row, &n_cols);
 
         // Sum exponentiated values
         float sum_val = 0.0f;
