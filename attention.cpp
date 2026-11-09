@@ -103,15 +103,53 @@ Tensor CausalAttention::forward(const Tensor& X) {
 
     cache.X = X;
 
-    // 1. Compute Linear Projections: Q, K, V
-    Tensor Q_proj = Tensor::matmul(X, W_q);
-    cache.Q = Tensor::add_bias(Q_proj, b_q);
+    // 1. Compute Linear Projections: Q, K, V in parallel via GCD
+    cache.Q = Tensor(T, d_model);
+    cache.K = Tensor(T, d_model);
+    cache.V = Tensor(T, d_model);
 
-    Tensor K_proj = Tensor::matmul(X, W_k);
-    cache.K = Tensor::add_bias(K_proj, b_k);
+    float* q_dest = cache.Q.data_ptr();
+    float* k_dest = cache.K.data_ptr();
+    float* v_dest = cache.V.data_ptr();
+    const float* x_src = X.data_ptr();
+    const float* wq_src = W_q.data_ptr();
+    const float* wk_src = W_k.data_ptr();
+    const float* wv_src = W_v.data_ptr();
+    const float* bq_src = b_q.data_ptr();
+    const float* bk_src = b_k.data_ptr();
+    const float* bv_src = b_v.data_ptr();
 
-    Tensor V_proj = Tensor::matmul(X, W_v);
-    cache.V = Tensor::add_bias(V_proj, b_v);
+    dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    dispatch_apply(3, queue, ^(size_t idx) {
+        if (idx == 0) {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        static_cast<int>(T), static_cast<int>(d_model), static_cast<int>(d_model),
+                        1.0f, x_src, static_cast<int>(d_model),
+                        wq_src, static_cast<int>(d_model),
+                        0.0f, q_dest, static_cast<int>(d_model));
+            for (size_t r = 0; r < T; ++r) {
+                vDSP_vadd(q_dest + r * d_model, 1, bq_src, 1, q_dest + r * d_model, 1, d_model);
+            }
+        } else if (idx == 1) {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        static_cast<int>(T), static_cast<int>(d_model), static_cast<int>(d_model),
+                        1.0f, x_src, static_cast<int>(d_model),
+                        wk_src, static_cast<int>(d_model),
+                        0.0f, k_dest, static_cast<int>(d_model));
+            for (size_t r = 0; r < T; ++r) {
+                vDSP_vadd(k_dest + r * d_model, 1, bk_src, 1, k_dest + r * d_model, 1, d_model);
+            }
+        } else {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        static_cast<int>(T), static_cast<int>(d_model), static_cast<int>(d_model),
+                        1.0f, x_src, static_cast<int>(d_model),
+                        wv_src, static_cast<int>(d_model),
+                        0.0f, v_dest, static_cast<int>(d_model));
+            for (size_t r = 0; r < T; ++r) {
+                vDSP_vadd(v_dest + r * d_model, 1, bv_src, 1, v_dest + r * d_model, 1, d_model);
+            }
+        }
+    });
 
     // 2. Multi-Head Scaled Dot-Product Attention with Strict Causal Masking
     cache.Q_heads.resize(n_heads);
@@ -127,8 +165,6 @@ Tensor CausalAttention::forward(const Tensor& X) {
     const float* K_ptr = cache.K.data_ptr();
     const float* V_ptr = cache.V.data_ptr();
     const size_t head_bytes = head_dim * sizeof(float);
-
-    dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
     dispatch_apply(n_heads, queue, ^(size_t h) {
         Tensor Q_h(T, head_dim);
         Tensor K_h(T, head_dim);
@@ -219,15 +255,53 @@ Tensor CausalAttention::forward_prefill(const Tensor& X, KVCache& kv_cache) {
         throw std::invalid_argument("Sequence length exceeds max_seq_len in forward_prefill");
     }
 
-    // 1. Compute Linear Projections: Q, K, V
-    Tensor Q_proj = Tensor::matmul(X, W_q);
-    Tensor Q = Tensor::add_bias(Q_proj, b_q);
+    // 1. Compute Linear Projections: Q, K, V in parallel via GCD
+    Tensor Q(T, d_model);
+    Tensor K(T, d_model);
+    Tensor V(T, d_model);
 
-    Tensor K_proj = Tensor::matmul(X, W_k);
-    Tensor K = Tensor::add_bias(K_proj, b_k);
+    float* q_dest = Q.data_ptr();
+    float* k_dest = K.data_ptr();
+    float* v_dest = V.data_ptr();
+    const float* x_src = X.data_ptr();
+    const float* wq_src = W_q.data_ptr();
+    const float* wk_src = W_k.data_ptr();
+    const float* wv_src = W_v.data_ptr();
+    const float* bq_src = b_q.data_ptr();
+    const float* bk_src = b_k.data_ptr();
+    const float* bv_src = b_v.data_ptr();
 
-    Tensor V_proj = Tensor::matmul(X, W_v);
-    Tensor V = Tensor::add_bias(V_proj, b_v);
+    dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    dispatch_apply(3, queue, ^(size_t idx) {
+        if (idx == 0) {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        static_cast<int>(T), static_cast<int>(d_model), static_cast<int>(d_model),
+                        1.0f, x_src, static_cast<int>(d_model),
+                        wq_src, static_cast<int>(d_model),
+                        0.0f, q_dest, static_cast<int>(d_model));
+            for (size_t r = 0; r < T; ++r) {
+                vDSP_vadd(q_dest + r * d_model, 1, bq_src, 1, q_dest + r * d_model, 1, d_model);
+            }
+        } else if (idx == 1) {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        static_cast<int>(T), static_cast<int>(d_model), static_cast<int>(d_model),
+                        1.0f, x_src, static_cast<int>(d_model),
+                        wk_src, static_cast<int>(d_model),
+                        0.0f, k_dest, static_cast<int>(d_model));
+            for (size_t r = 0; r < T; ++r) {
+                vDSP_vadd(k_dest + r * d_model, 1, bk_src, 1, k_dest + r * d_model, 1, d_model);
+            }
+        } else {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        static_cast<int>(T), static_cast<int>(d_model), static_cast<int>(d_model),
+                        1.0f, x_src, static_cast<int>(d_model),
+                        wv_src, static_cast<int>(d_model),
+                        0.0f, v_dest, static_cast<int>(d_model));
+            for (size_t r = 0; r < T; ++r) {
+                vDSP_vadd(v_dest + r * d_model, 1, bv_src, 1, v_dest + r * d_model, 1, d_model);
+            }
+        }
+    });
 
     // 2. Cache K and V in contiguous head-major layout: (n_heads * max_seq_len * head_dim)
     const size_t total_cache_elements = n_heads * max_seq_len * head_dim;
@@ -261,7 +335,6 @@ Tensor CausalAttention::forward_prefill(const Tensor& X, KVCache& kv_cache) {
     float* concat_ptr = concat_heads.data_ptr();
     const float* Q_ptr = Q.data_ptr();
 
-    dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
     dispatch_apply(n_heads, queue, ^(size_t h) {
         Tensor Q_h(T, head_dim);
         for (size_t t = 0; t < T; ++t) {
@@ -463,7 +536,6 @@ void CausalAttention::backward(const Tensor& grad_output, Tensor& grad_X) {
     float* dV_ptr = dV.data_ptr();
     const float* d_concat_ptr = d_concat.data_ptr();
     const size_t head_bytes = head_dim * sizeof(float);
-
     dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
     dispatch_apply(n_heads, queue, ^(size_t h) {
         Tensor d_head_out_h(T, head_dim);
@@ -560,45 +632,54 @@ void CausalAttention::backward(const Tensor& grad_output, Tensor& grad_X) {
     });
 
     // 3. Input Projections Backward (Q, K, V -> X)
+    // Run dW and db parameter updates for Q, K, V in parallel across cores via GCD
+    const float* x_ptr = cache.X.data_ptr();
+    const float* dq_ptr = dQ.data_ptr();
+    const float* dk_ptr = dK.data_ptr();
+    const float* dv_ptr = dV.data_ptr();
+    float* bq_grad = b_q.grad_ptr();
+    float* bk_grad = b_k.grad_ptr();
+    float* bv_grad = b_v.grad_ptr();
+    float* wq_grad = W_q.grad_ptr();
+    float* wk_grad = W_k.grad_ptr();
+    float* wv_grad = W_v.grad_ptr();
 
-    // db_q += col_sums(dQ)
-    for (size_t r = 0; r < T; ++r) {
-        vDSP_vadd(b_q.grad_ptr(), 1, dQ.data_ptr() + r * d_model, 1, b_q.grad_ptr(), 1, d_model);
-    }
-    // dW_q += X^T x dQ
-    cblas_sgemm(
-        CblasRowMajor, CblasTrans, CblasNoTrans,
-        static_cast<int>(d_model), static_cast<int>(d_model), static_cast<int>(T),
-        1.0f, cache.X.data_ptr(), static_cast<int>(d_model),
-        dQ.data_ptr(), static_cast<int>(d_model),
-        1.0f, W_q.grad_ptr(), static_cast<int>(d_model)
-    );
-
-    // db_k += col_sums(dK)
-    for (size_t r = 0; r < T; ++r) {
-        vDSP_vadd(b_k.grad_ptr(), 1, dK.data_ptr() + r * d_model, 1, b_k.grad_ptr(), 1, d_model);
-    }
-    // dW_k += X^T x dK
-    cblas_sgemm(
-        CblasRowMajor, CblasTrans, CblasNoTrans,
-        static_cast<int>(d_model), static_cast<int>(d_model), static_cast<int>(T),
-        1.0f, cache.X.data_ptr(), static_cast<int>(d_model),
-        dK.data_ptr(), static_cast<int>(d_model),
-        1.0f, W_k.grad_ptr(), static_cast<int>(d_model)
-    );
-
-    // db_v += col_sums(dV)
-    for (size_t r = 0; r < T; ++r) {
-        vDSP_vadd(b_v.grad_ptr(), 1, dV.data_ptr() + r * d_model, 1, b_v.grad_ptr(), 1, d_model);
-    }
-    // dW_v += X^T x dV
-    cblas_sgemm(
-        CblasRowMajor, CblasTrans, CblasNoTrans,
-        static_cast<int>(d_model), static_cast<int>(d_model), static_cast<int>(T),
-        1.0f, cache.X.data_ptr(), static_cast<int>(d_model),
-        dV.data_ptr(), static_cast<int>(d_model),
-        1.0f, W_v.grad_ptr(), static_cast<int>(d_model)
-    );
+    dispatch_apply(3, queue, ^(size_t idx) {
+        if (idx == 0) {
+            for (size_t r = 0; r < T; ++r) {
+                vDSP_vadd(bq_grad, 1, dq_ptr + r * d_model, 1, bq_grad, 1, d_model);
+            }
+            cblas_sgemm(
+                CblasRowMajor, CblasTrans, CblasNoTrans,
+                static_cast<int>(d_model), static_cast<int>(d_model), static_cast<int>(T),
+                1.0f, x_ptr, static_cast<int>(d_model),
+                dq_ptr, static_cast<int>(d_model),
+                1.0f, wq_grad, static_cast<int>(d_model)
+            );
+        } else if (idx == 1) {
+            for (size_t r = 0; r < T; ++r) {
+                vDSP_vadd(bk_grad, 1, dk_ptr + r * d_model, 1, bk_grad, 1, d_model);
+            }
+            cblas_sgemm(
+                CblasRowMajor, CblasTrans, CblasNoTrans,
+                static_cast<int>(d_model), static_cast<int>(d_model), static_cast<int>(T),
+                1.0f, x_ptr, static_cast<int>(d_model),
+                dk_ptr, static_cast<int>(d_model),
+                1.0f, wk_grad, static_cast<int>(d_model)
+            );
+        } else {
+            for (size_t r = 0; r < T; ++r) {
+                vDSP_vadd(bv_grad, 1, dv_ptr + r * d_model, 1, bv_grad, 1, d_model);
+            }
+            cblas_sgemm(
+                CblasRowMajor, CblasTrans, CblasNoTrans,
+                static_cast<int>(d_model), static_cast<int>(d_model), static_cast<int>(T),
+                1.0f, x_ptr, static_cast<int>(d_model),
+                dv_ptr, static_cast<int>(d_model),
+                1.0f, wv_grad, static_cast<int>(d_model)
+            );
+        }
+    });
 
     // Accumulate dX = dQ x W_q^T + dK x W_k^T + dV x W_v^T into grad_X.grad
     cblas_sgemm(
